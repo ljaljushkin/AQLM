@@ -1,0 +1,65 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            // entrypoint https://github.com/pytorch/pytorch/blob/8a744c31d3c5194b4850869a112d94912c1e08b4/setup.py#L968
+            // does't work: https://stackoverflow.com/questions/61693769/vs-code-run-debug-configuration-for-a-console-script-in-module-mode
+            // "module": "torch.distributed.run:main",
+            // "module": "torch.distributed.launch", // python -m torch.distributed.launch
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": [
+                // "--nproc-per-node=1",
+                // "${file}",
+                "--base_model=TinyLlama/TinyLlama_v1.1",
+                // "--quant_model=ISTA-DASLab/Phi-3-mini-4k-instruct-AQLM-1x16",
+                "--nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/TinyLlama_v1_1/FQ_4bit_emb32",
+                "--dataset=pajama",
+                // "--dataset_name=wikitext",
+                // "--block_type=Phi3DecoderLayer",
+                "--nsamples=6",
+                "--model_seqlen=1028", // TODO: CUDA OOM with 4096
+                "--val_size=3",
+                "--lr=1e-5",
+                "--adam_beta1=0.90",
+                "--adam_beta2=0.999",
+                // "--max_epochs=1",//
+                "--epochs=1",
+                "--early_stop=3",
+                "--batch_size=3",
+                "--microbatch_size=1",
+                // "--save $DATA_PATH",
+                // "--gradient_checkpointing",
+                "--trust_remote_code",
+            ],
+            // FULL CMD:
+            // torchrun \
+            // finetune.py \
+            // --base_model=microsoft/Phi-3-mini-4k-instruct \
+            // --quantized_model=ISTA-DASLab/Phi-3-mini-4k-instruct-AQLM-1x16 \
+            // --block_type=Phi3DecoderLayer \
+            // --lr=1e-5 \
+            // --adam_beta1=0.90 \
+            // --adam_beta2=0.999 \
+            // --max_epochs=1 \
+            // --batch_size=8 \
+            // --microbatch_size=4 \
+            // --gradient_checkpointing \
+            // --dataset_name=wikitext \
+            // --dataset_config_name=wikitext-2-v1 \
+            // --trust_remote_code
+
+
+            // "env": {
+            //     "RANK": 1,
+            //     "WORLD_SIZE": 1,
+            // }
+        }
+    ]
+}

@@ -19,7 +19,54 @@ from main import perplexity_eval
 from src.datautils import get_loaders
 from src.modelutils import get_layers, get_model, save_not_quantized_weights
 from src.utils import _extract_into_tensor, maybe_get_0th_element
+from transformers import (
+    AutoTokenizer
+)
+from pathlib import Path
 
+def load_nncf_quantized_model(nncf_ckpt_dir, student_model, tokenizer):
+    tokenized_text = tokenizer("example", return_tensors="pt")
+    input_ids = tokenized_text["input_ids"][:, :-1]
+    attention_mask = tokenized_text["attention_mask"][:, :-1]
+    example_input = {
+        "input_ids": input_ids.cuda(),
+        "attention_mask": attention_mask.cuda(),
+    }
+    nncf_ckpt = torch.load(Path(nncf_ckpt_dir) / 'nncf_checkpoint.pth')
+    from nncf.torch import load_from_config
+
+    # # NOTE: model.model because was compressed hf_model.model, where hf_model =AutoModelForCausalLM(...)
+    student_model.model = load_from_config(
+        student_model.model, nncf_ckpt["nncf_config"],
+        example_input=example_input
+    )
+    student_model.model.nncf.load_state_dict(nncf_ckpt["nncf_state_dict"])
+    return student_model
+
+def get_nb_trainable_parameters(module):
+    r"""
+    Returns the number of trainable parameters and number of all parameters in the model.
+    """
+    # note: same as PeftModel.get_nb_trainable_parameters
+    trainable_params = 0
+    all_param = 0
+    for _, param in module.named_parameters():
+        num_params = param.numel()
+        all_param += num_params
+        if param.requires_grad:
+            trainable_params += num_params
+
+    return trainable_params, all_param
+
+
+def print_trainable_parameters(module):
+    trainable_params, all_param = get_nb_trainable_parameters(module)
+
+    print(
+        f"trainable params: {trainable_params:,d} || "
+        f"all params: {all_param:,d} || "
+        f"trainable%: {100 * trainable_params / all_param:.4f}"
+    )
 
 @torch.inference_mode()
 def cache_hiddens(model, dataloader):
@@ -62,12 +109,23 @@ def evaluate(model, lm_head, loader, hiddens, batch_size, dtype):
 def finetune(model, train_loader, train_hiddens, args, device, val_loader=None, val_hiddens=None):
     # cast model to finetune dtype
     model.to(args.finetune_dtype)
+    # NOTE: copy is needed for calculating target outputs
     lm_head = deepcopy(model.lm_head)
     for param in lm_head.parameters():
         param.requires_grad = False
 
-    diff_params = {name: param for name, param in model.named_parameters() if param.requires_grad}
-    print(f"Fine-tuning {sum(param.numel() for _, param in diff_params.items())} parameters")
+    for param in model.parameters():
+        param.requires_grad = False
+    diff_params = {}
+    for name, param in model.named_parameters():
+        if "lora" in name:  # or "11.self_attn.v_proj.weight" in name:  # or 'input' in name:
+            param.requires_grad = True
+            diff_params[name] = param
+    num_grad = sum(map(lambda x: x.requires_grad, model.parameters()))
+    num_lora = sum(map(lambda x: "lora" in x[0], model.named_parameters()))
+    assert num_lora == num_grad, f"number of lora params != number of learnable params ({num_lora} vs {num_grad})"
+    print_trainable_parameters(model)
+
     opt = torch.optim.Adam(diff_params.values(), lr=args.lr, betas=(args.adam_beta1, args.adam_beta2))
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
 
@@ -174,10 +232,16 @@ if __name__ == "__main__":
         required=True,
         help="path or name of the teacher model",
     )
+    # parser.add_argument(
+    #     "--quant_model",
+    #     type=str,
+    #     required=True,
+    #     help="path to quantized model",
+    # )
     parser.add_argument(
-        "--quant_model",
+        "--nncf_ckpt_dir",
         type=str,
-        required=True,
+        required=False,
         help="path to quantized model",
     )
     # Data params
@@ -360,9 +424,17 @@ if __name__ == "__main__":
         orig_val_hiddens = None
     del orig_model
     torch.cuda.empty_cache()
-    quant_model = get_model(
-        args.base_model, args.quant_model, args.dtype, args.device_map, trust_remote_code=args.trust_remote_code
+    # TODO: probably nothing bad will happen with model after caching and no need to load from scratch again
+    orig_model = get_model(args.base_model, None, args.dtype, args.device_map, trust_remote_code=args.trust_remote_code)
+    if not args.device_map:
+        orig_model = orig_model.to(device)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.base_model, use_fast=args.use_fast_tokenizer, trust_remote_code=True
     )
+    quant_model = load_nncf_quantized_model(args.nncf_ckpt_dir, orig_model, tokenizer)
+    # quant_model = get_model(
+    #     args.base_model, args.quant_model, args.dtype, args.device_map, trust_remote_code=args.trust_remote_code
+    # )
     if not args.device_map:
         quant_model = quant_model.to(device)
 
