@@ -23,20 +23,23 @@
                 "--dataset=pajama",
                 // "--dataset_name=wikitext",
                 // "--block_type=Phi3DecoderLayer",
-                "--nsamples=6",
-                "--model_seqlen=1028", // TODO: CUDA OOM with 4096
-                "--val_size=3",
+                "--nsamples=128", // 1024
+                "--model_seqlen=1024", // TODO: CUDA OOM with 4096
+                "--val_size=0", // 128
                 "--lr=1e-5",
                 "--adam_beta1=0.90",
                 "--adam_beta2=0.999",
                 // "--max_epochs=1",//
-                "--epochs=1",
-                "--early_stop=3",
-                "--batch_size=3",
-                "--microbatch_size=1",
-                // "--save $DATA_PATH",
+                "--epochs=3",
+                "--early_stop=2",
+                "--batch_size=4", //
+                "--microbatch_size=2",
+                "--exp_name=debug",
                 // "--gradient_checkpointing",
                 "--trust_remote_code",
+                "--print_every_steps=1",
+                "--eval_every_steps=50",
+                "--keep_best_model"
             ],
             // FULL CMD:
             // torchrun \
