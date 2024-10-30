@@ -203,13 +203,13 @@ def finetune(model, train_loader, train_hiddens, args, device, val_loader=None, 
     )
 
     eval_step = -1
-    NUM_LAYERS = 2
+    NUM_LAYERS = 5
     FREQUENCY = 3
     for epoch in range(args.epochs):
         if epoch % FREQUENCY == 0:
             num_iters = epoch // FREQUENCY
             active_layers_ids = list(range(num_iters * NUM_LAYERS, (num_iters + 1) * NUM_LAYERS))
-            active_layers_ids = list(range(30,32))
+            # active_layers_ids = list(range(30,32))
             diff_params = set_trainable(model, active_layers_ids)
             if not diff_params:
                 print('All layers are tuned!')
@@ -579,6 +579,7 @@ if __name__ == "__main__":
         args.base_model, use_fast=args.use_fast_tokenizer, trust_remote_code=True
     )
     generate_chicken(orig_model, tokenizer, "FP32")
+    # exit()
     # evaluate_model(orig_model, args)
 
     # cache logits
@@ -615,7 +616,6 @@ if __name__ == "__main__":
     # evaluate_model(quant_model, args)
     if not args.device_map:
         quant_model = quant_model.to(device)
-
 
     ckpt_dir = Path(args.nncf_ckpt_dir) / exp_name
     ckpt_dir.mkdir(exist_ok=True, parents=True)

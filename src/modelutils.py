@@ -57,6 +57,7 @@ def get_model(
         model_kwargs["attn_implementation"] = attn_implementation
 
     with suspend_nn_inits():
+        print('nlyalyus: device_map', device_map)
         model = AutoModelForCausalLM.from_pretrained(
             pretrained_model_name_or_path=model_path,
             trust_remote_code=trust_remote_code,
