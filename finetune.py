@@ -1,4 +1,4 @@
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 import argparse
 import os
 import shutil
@@ -148,6 +148,26 @@ def evaluate_perplexity(
     ppl = torch.exp(total_nll / total_tokens)
     return ppl.item()
 
+def set_trainable(model, list_of_indexes: List[int]):
+    for param in model.parameters():
+        param.requires_grad = False
+
+    diff_params = {}
+    for name, param in model.named_parameters():
+        for index in list_of_indexes:
+            if f"layers_{index}_" in name and "lora" in name:
+                print('Tune: ', name)
+                param.requires_grad = True
+                diff_params[name] = param
+                break
+
+    # num_grad = sum(map(lambda x: x.requires_grad, model.parameters()))
+    # num_lora = sum(map(lambda x: "lora" in x[0], model.named_parameters()))
+    # assert num_lora == num_grad, f"number of lora params != number of learnable params ({num_lora} vs {num_grad})"
+    print_trainable_parameters(model)
+
+    return diff_params
+
 
 def finetune(model, train_loader, train_hiddens, args, device, val_loader=None, val_hiddens=None, ckpt_dir=None, eval_datasets=None):
     # cast model to finetune dtype
@@ -156,22 +176,6 @@ def finetune(model, train_loader, train_hiddens, args, device, val_loader=None, 
     lm_head = deepcopy(model.lm_head)
     for param in lm_head.parameters():
         param.requires_grad = False
-
-    for param in model.parameters():
-        param.requires_grad = False
-    diff_params = {}
-    for name, param in model.named_parameters():
-        if "lora" in name:#("input" in name or "lora" in name) and ("31" in name):# or "30" in name):# and '31' in name:  # or "11.self_attn.v_proj.weight" in name:  # or 'input' in name:
-            print(name)
-            param.requires_grad = True
-            diff_params[name] = param
-    # num_grad = sum(map(lambda x: x.requires_grad, model.parameters()))
-    # num_lora = sum(map(lambda x: "lora" in x[0], model.named_parameters()))
-    # assert num_lora == num_grad, f"number of lora params != number of learnable params ({num_lora} vs {num_grad})"
-    print_trainable_parameters(model)
-
-    opt = torch.optim.Adam(diff_params.values(), lr=args.lr, betas=(args.adam_beta1, args.adam_beta2))
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
 
     grad_accumulation_steps = args.batch_size // args.microbatch_size
     num_samples = len(train_loader)
@@ -197,8 +201,22 @@ def finetune(model, train_loader, train_hiddens, args, device, val_loader=None, 
         best_eval_perplexity=float("inf"),
         best_step=0,
     )
+
     eval_step = -1
+    NUM_LAYERS = 2
+    FREQUENCY = 3
     for epoch in range(args.epochs):
+        if epoch % FREQUENCY == 0:
+            num_iters = epoch // FREQUENCY
+            active_layers_ids = list(range(num_iters * NUM_LAYERS, (num_iters + 1) * NUM_LAYERS))
+            active_layers_ids = list(range(30,32))
+            diff_params = set_trainable(model, active_layers_ids)
+            if not diff_params:
+                print('All layers are tuned!')
+                break
+            opt = torch.optim.Adam(diff_params.values(), lr=args.lr, betas=(args.adam_beta1, args.adam_beta2))
+            scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
+
         # train loop
         model.train()
         # prepare batch indices
