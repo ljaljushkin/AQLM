@@ -29,12 +29,16 @@ from pathlib import Path
 
 def load_nncf_quantized_model(nncf_ckpt_dir, student_model, tokenizer):
     tokenized_text = tokenizer("example", return_tensors="pt")
-    input_ids = tokenized_text["input_ids"][:, :-1]
-    attention_mask = tokenized_text["attention_mask"][:, :-1]
+    input_ids = tokenized_text["input_ids"]#[:, :-1]
+    attention_mask = tokenized_text["attention_mask"]#[:, :-1]
+    position_ids = torch.cumsum(attention_mask, axis=1) - 1
+    position_ids[attention_mask == 0] = 1
     example_input = {
         "input_ids": input_ids.cuda(),
         "attention_mask": attention_mask.cuda(),
+        "position_ids": position_ids.cuda()
     }
+    print(example_input)
     nncf_ckpt = torch.load(Path(nncf_ckpt_dir) / 'nncf_checkpoint.pth')
     from nncf.torch import load_from_config
 
@@ -98,17 +102,14 @@ def kl_div(student_hiddens, teacher_hiddens):
     )
 
 def compute_validation_perplexities(args: argparse.Namespace, model: nn.Module, eval_datasets):
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     perplexities = {}
     for dataset_name, eval_dataset in eval_datasets.items():
-        if rank == 0:
-            print(f"Evaluating perplexity on {dataset_name} ...")
+        print(f"Evaluating perplexity on {dataset_name} ...")
         device = next(model.parameters()).device
         original_dtype = args.load_dtype if args.load_dtype != "auto" else None
         amp_dtype = args.amp_dtype if args.amp_dtype is not None else original_dtype
         ppl = evaluate_perplexity(model, eval_dataset, args.model_seqlen, device=device, amp_dtype=amp_dtype)
-        if rank == 0:
-            print(f"{dataset_name} perplexity: {ppl:.9f}")
+        print(f"{dataset_name} perplexity: {ppl:.9f}")
         perplexities[dataset_name] = ppl
     return perplexities
 
@@ -118,24 +119,20 @@ def evaluate_perplexity(
     model: nn.Module, data: torch.Tensor, seqlen: int, device: torch.device, amp_dtype: Optional[torch.dtype] = None
 ) -> float:
     """Perplexity evaluation as per https://github.com/IST-DASLab/gptq (standard among quantization research)"""
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-
     inps = [
         data[:, start : start + seqlen] for start in range(0, data.shape[1], seqlen) if start + seqlen < data.shape[1]
     ]  # ignore last incomplete sequence as in the GPTQ paper
     num_sequences_without_padding = len(inps)
 
-    # pad sequences to be divisible by world_size for DDP/FSDP compatibility
-    num_padding_sequences = -len(inps) % world_size
-    inps.extend([inps[-1]] * num_padding_sequences)
+    # NOTE: world_size = 1 -> num_padding_sequences=0
+    # # pad sequences to be divisible by world_size for DDP/FSDP compatibility
+    # num_padding_sequences = -len(inps) % world_size
+    # inps.extend([inps[-1]] * num_padding_sequences)
 
     total_nll_and_tokens = torch.tensor([0.0, 0.0], dtype=torch.float64, device=device)
     total_nll, total_tokens = total_nll_and_tokens[0], total_nll_and_tokens[1]
 
-    for sequence_index, input_ids in enumerate(tqdm(inps, desc="Evaluating perplexity") if rank == 0 else inps):
-        if sequence_index % world_size != rank:
-            continue
+    for sequence_index, input_ids in enumerate(tqdm(inps, desc="Evaluating perplexity")):
         input_ids = input_ids.to(device)
         with torch.cuda.amp.autocast(enabled=amp_dtype is not None, dtype=amp_dtype or torch.float32):
             lm_logits = model(input_ids).logits
@@ -148,8 +145,6 @@ def evaluate_perplexity(
             total_nll += loss.float() * shift_labels.numel()
             total_tokens += shift_labels.numel()
 
-    if world_size > 1:
-        torch.distributed.all_reduce(total_nll_and_tokens, op=torch.distributed.ReduceOp.SUM)
     ppl = torch.exp(total_nll / total_tokens)
     return ppl.item()
 
@@ -166,12 +161,13 @@ def finetune(model, train_loader, train_hiddens, args, device, val_loader=None, 
         param.requires_grad = False
     diff_params = {}
     for name, param in model.named_parameters():
-        if "lora" in name:  # or "11.self_attn.v_proj.weight" in name:  # or 'input' in name:
+        if "lora" in name:#("input" in name or "lora" in name) and ("31" in name):# or "30" in name):# and '31' in name:  # or "11.self_attn.v_proj.weight" in name:  # or 'input' in name:
+            print(name)
             param.requires_grad = True
             diff_params[name] = param
-    num_grad = sum(map(lambda x: x.requires_grad, model.parameters()))
-    num_lora = sum(map(lambda x: "lora" in x[0], model.named_parameters()))
-    assert num_lora == num_grad, f"number of lora params != number of learnable params ({num_lora} vs {num_grad})"
+    # num_grad = sum(map(lambda x: x.requires_grad, model.parameters()))
+    # num_lora = sum(map(lambda x: "lora" in x[0], model.named_parameters()))
+    # assert num_lora == num_grad, f"number of lora params != number of learnable params ({num_lora} vs {num_grad})"
     print_trainable_parameters(model)
 
     opt = torch.optim.Adam(diff_params.values(), lr=args.lr, betas=(args.adam_beta1, args.adam_beta2))
@@ -184,8 +180,9 @@ def finetune(model, train_loader, train_hiddens, args, device, val_loader=None, 
 
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()
 
-    compute_validation_perplexities(args, model, eval_datasets)
+    # compute_validation_perplexities(args, model, eval_datasets)
 
     metadata = dict(
         current_epoch=0,
@@ -200,7 +197,7 @@ def finetune(model, train_loader, train_hiddens, args, device, val_loader=None, 
         best_eval_perplexity=float("inf"),
         best_step=0,
     )
-
+    eval_step = -1
     for epoch in range(args.epochs):
         # train loop
         model.train()
@@ -239,26 +236,29 @@ def finetune(model, train_loader, train_hiddens, args, device, val_loader=None, 
                 # reset accumulated step and loss
                 metadata["grad_steps_accumulated"] = 0
                 metadata["total_optimizer_steps"] += 1
-
-            if args.print_every_steps and metadata["total_optimizer_steps"] % args.print_every_steps == 0:
-                metadata["aggregated_loss"] = loss_numerator / loss_denominator
+                metadata["aggregated_loss"] = metadata["loss_numerator"] / metadata["loss_denominator"]
                 metadata["loss_numerator"] = metadata["loss_denominator"] = 0
-                if rank == 0:
-                    print(
-                        f"epoch {metadata['current_epoch']}\tbatch {batch_index}",
-                        f"\t| total updates = {metadata['total_optimizer_steps']}",
-                        f"\tloss = {metadata['aggregated_loss']:.9f}",
-                    )
 
-            if args.eval_every_steps and metadata["total_optimizer_steps"] % args.eval_every_steps == 0:
+            if args.print_every_steps and metadata["total_optimizer_steps"] % args.print_every_steps == 0 and metadata["grad_steps_accumulated"] == 0:
+                print(
+                    f"epoch {metadata['current_epoch']}\t", # TODO: batch index and re-do trainloder??
+                    f"\t| total updates = {metadata['total_optimizer_steps']}",
+                    f"\tloss = {metadata['aggregated_loss']:.9f}",
+                )
+
+            # TODO: make no eval for 0-fiteration each time!
+            if args.eval_every_steps and \
+                metadata["total_optimizer_steps"] % args.eval_every_steps == 0 and \
+                    metadata["total_optimizer_steps"] != eval_step and \
+                        not(args.skip_first_eval and metadata["total_optimizer_steps"] == 0):
+                eval_step = metadata["total_optimizer_steps"]
                 # TODO: why removed eval loss ??? maybe needed??? quick and on test data
                 perplexity_scores = compute_validation_perplexities(args, model, eval_datasets)
                 for dataset_name, perplexity in perplexity_scores.items():
                     metadata[f"perplexity_{dataset_name}"] = perplexity
                 metric_name = metadata["early_stop_on"]
                 if perplexity_scores[metric_name] < metadata["best_eval_perplexity"]:
-                    if rank == 0:
-                        print(f"New best perplexity ({metric_name}) = {perplexity_scores[metric_name]:.9f}")
+                    print(f"New best perplexity ({metric_name}) = {perplexity_scores[metric_name]:.9f}")
                     metadata["best_eval_perplexity"] = perplexity_scores[args.eval_datasets[0]]
                     metadata["best_step"] = metadata["total_optimizer_steps"]
                     if args.keep_best_model:
@@ -393,6 +393,7 @@ if __name__ == "__main__":
         help="Datasets to run evaluation on",
     )
     parser.add_argument("--keep_best_model", action="store_true", help="Save best model state separately")
+    parser.add_argument("--skip_first_eval", action="store_true", default=None)
     # Training params
     parser.add_argument(
         "--lr",
@@ -496,7 +497,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     if args.keep_best_model:
-        assert args.exp_name is not None, f"--keep_best_model requires --exp_name path"
+        # assert args.exp_name is not None, f"--keep_best_model requires --exp_name path"
         assert args.eval_every_steps is not None, f"--keep_best_model requires --eval_every_steps"
         assert args.eval_datasets is not None, f"--keep_best_model requires --eval_datasets"
 
@@ -515,9 +516,10 @@ if __name__ == "__main__":
     assert torch.cuda.is_available()
     device = "cuda"
     args.devices = [device]  # needed for perplexity eval
+    exp_name = args.exp_name if args.exp_name else f"n{args.nsamples}"
     if args.wandb:
         assert has_wandb, "`wandb` not installed, try pip install `wandb`"
-        wandb.init(config=args)
+        wandb.init(config=args, name=exp_name)
 
     # get data
     dataloader = get_loaders(
@@ -553,6 +555,8 @@ if __name__ == "__main__":
     orig_model = get_model(args.base_model, None, args.dtype, args.device_map, trust_remote_code=args.trust_remote_code)
     if not args.device_map:
         orig_model = orig_model.to(device)
+    # compute_validation_perplexities(args, orig_model, eval_datasets)
+    # exit()
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model, use_fast=args.use_fast_tokenizer, trust_remote_code=True
     )
@@ -594,8 +598,10 @@ if __name__ == "__main__":
     if not args.device_map:
         quant_model = quant_model.to(device)
 
-    ckpt_dir = MODEL_DIR / args.exp_name
+
+    ckpt_dir = Path(args.nncf_ckpt_dir) / exp_name
     ckpt_dir.mkdir(exist_ok=True, parents=True)
+
 
     # finetune
     finetune(
@@ -609,6 +615,8 @@ if __name__ == "__main__":
         ckpt_dir=ckpt_dir,
         eval_datasets=eval_datasets
     )
+
+    compute_validation_perplexities(args, quant_model, eval_datasets)
 
     print_memory_stats()
 
