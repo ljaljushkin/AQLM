@@ -10,7 +10,7 @@ from torch import nn as nn
 from accelerate.hooks import remove_hook_from_submodules
 from tqdm import tqdm, trange
 from nncf.torch.dynamic_graph.context import forward_nncf_trace
-
+import transformers
 try:
     import wandb
 
@@ -134,7 +134,7 @@ def evaluate_perplexity(
 
     for sequence_index, input_ids in enumerate(tqdm(inps, desc="Evaluating perplexity")):
         input_ids = input_ids.to(device)
-        with torch.cuda.amp.autocast(enabled=amp_dtype is not None, dtype=amp_dtype or torch.float32):
+        with torch.amp.autocast('cuda', enabled=amp_dtype is not None, dtype=amp_dtype or torch.float32):
             lm_logits = model(input_ids).logits
 
         if sequence_index < num_sequences_without_padding:
@@ -148,14 +148,16 @@ def evaluate_perplexity(
     ppl = torch.exp(total_nll / total_tokens)
     return ppl.item()
 
-def set_trainable(model, list_of_indexes: List[int]):
+def set_trainable(model, list_of_indexes: List[int], is_lora=True):
     for param in model.parameters():
         param.requires_grad = False
 
     diff_params = {}
+
+    word_to_find = "lora" if is_lora else "input"
     for name, param in model.named_parameters():
         for index in list_of_indexes:
-            if f"layers_{index}_" in name and "lora" in name:
+            if f"layers_{index}_" in name and word_to_find in name:
                 print('Tune: ', name)
                 param.requires_grad = True
                 diff_params[name] = param
@@ -167,6 +169,10 @@ def set_trainable(model, list_of_indexes: List[int]):
     print_trainable_parameters(model)
 
     return diff_params
+
+def get_lr(optimizer):
+    for param_group in optimizer.param_groups:
+        return param_group['lr']
 
 
 def finetune(model, train_loader, train_hiddens, args, device, val_loader=None, val_hiddens=None, ckpt_dir=None, eval_datasets=None):
@@ -186,8 +192,6 @@ def finetune(model, train_loader, train_hiddens, args, device, val_loader=None, 
         model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
 
-    # compute_validation_perplexities(args, model, eval_datasets)
-
     metadata = dict(
         current_epoch=0,
         microbatches_since_epoch_start=0,
@@ -201,21 +205,40 @@ def finetune(model, train_loader, train_hiddens, args, device, val_loader=None, 
         best_eval_perplexity=float("inf"),
         best_step=0,
     )
+    NUM_LAYERS = 32
+    HIDDEN_DIM = 3072
+    num_switches = NUM_LAYERS // args.num_blocks
+    num_epochs = num_switches * args.frequency
+    # num_epochs = args.epochs
 
-    eval_step = -1
-    NUM_LAYERS = 5
-    FREQUENCY = 3
-    for epoch in range(args.epochs):
-        if epoch % FREQUENCY == 0:
-            num_iters = epoch // FREQUENCY
-            active_layers_ids = list(range(num_iters * NUM_LAYERS, (num_iters + 1) * NUM_LAYERS))
-            # active_layers_ids = list(range(30,32))
-            diff_params = set_trainable(model, active_layers_ids)
-            if not diff_params:
-                print('All layers are tuned!')
-                break
-            opt = torch.optim.Adam(diff_params.values(), lr=args.lr, betas=(args.adam_beta1, args.adam_beta2))
-            scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
+    # diff_params = set_trainable(model, list_of_indexes=[31])
+    # opt = torch.optim.AdamW(diff_params.values(), lr=args.lr, betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.weight_decay)
+    # scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
+    # num_training_steps = epoch_samples // args.batch_size
+    # num_warmup_steps = num_training_steps // 3 if args.warmup else 0
+    # lr_scheduler = transformers.get_cosine_schedule_with_warmup(
+    #     opt, num_warmup_steps=num_warmup_steps, num_training_steps=num_epochs * num_training_steps, num_cycles=0.5
+    # )
+    for epoch in range(num_epochs):
+        is_lora = epoch % 2 != 0
+        metadata["is_lora"] = 1 if is_lora else 0
+        # if epoch % args.frequency == 0:
+        i_switch = epoch // args.frequency
+        metadata["num_tuned_blocks"] = i_switch * args.num_blocks
+        active_layers_ids = list(range(i_switch * args.num_blocks, (i_switch + 1) * args.num_blocks))
+        # active_layers_ids = list(range(30,32))
+        diff_params = set_trainable(model, active_layers_ids, is_lora=is_lora)
+        if not diff_params:
+            print('All layers are tuned!')
+            break
+
+        # Slightly un-intuitive but we want to increase the rate as the layers progress
+        # because error accumulates and we want to correct it more strongly.
+        scaled_lr = args.lr * (1 + args.lr_scale * (i_switch / num_switches))
+        scaled_lr = scaled_lr if is_lora else scaled_lr / 50
+        metadata["scaled_lr"] = scaled_lr
+        opt = torch.optim.AdamW(diff_params.values(), lr=scaled_lr, betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.weight_decay)
+        scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
 
         # train loop
         model.train()
@@ -245,11 +268,17 @@ def finetune(model, train_loader, train_hiddens, args, device, val_loader=None, 
             if not torch.isfinite(loss).item():
                 raise ValueError(f"Fine-tuning loss is {loss}")
 
-            scaler.scale(loss / grad_accumulation_steps).backward()
+            if is_lora:
+                scaler.scale(loss / grad_accumulation_steps).backward()
+            else:
+                (loss / grad_accumulation_steps).backward()
 
             if metadata["grad_steps_accumulated"] == grad_accumulation_steps:
-                scaler.step(opt)
-                scaler.update()
+                # lr_scheduler.step()
+                metadata["lr"] = get_lr(opt)
+                if is_lora:
+                    scaler.step(opt)
+                    scaler.update()
                 opt.zero_grad()
                 # reset accumulated step and loss
                 metadata["grad_steps_accumulated"] = 0
@@ -265,25 +294,37 @@ def finetune(model, train_loader, train_hiddens, args, device, val_loader=None, 
                 )
 
             # TODO: make no eval for 0-fiteration each time!
-            if args.eval_every_steps and \
-                metadata["total_optimizer_steps"] % args.eval_every_steps == 0 and \
-                    metadata["total_optimizer_steps"] != eval_step and \
-                        not(args.skip_first_eval and metadata["total_optimizer_steps"] == 0):
-                eval_step = metadata["total_optimizer_steps"]
-                # TODO: why removed eval loss ??? maybe needed??? quick and on test data
-                perplexity_scores = compute_validation_perplexities(args, model, eval_datasets)
-                for dataset_name, perplexity in perplexity_scores.items():
-                    metadata[f"perplexity_{dataset_name}"] = perplexity
-                metric_name = metadata["early_stop_on"]
-                if perplexity_scores[metric_name] < metadata["best_eval_perplexity"]:
-                    print(f"New best perplexity ({metric_name}) = {perplexity_scores[metric_name]:.9f}")
-                    metadata["best_eval_perplexity"] = perplexity_scores[args.eval_datasets[0]]
-                    metadata["best_step"] = metadata["total_optimizer_steps"]
-                    if args.keep_best_model:
-                        save_checkpoint(model.model, ckpt_dir)
+            # if args.eval_every_steps and \
+            #     metadata["total_optimizer_steps"] % args.eval_every_steps == 0 and \
+            # if epoch % (args.frequency // 2) == 0 and epoch != 0:
+            #     # not(args.skip_first_eval and epoch == 0):
+            #     # TODO: why removed eval loss ??? maybe needed??? quick and on test data
+            #     perplexity_scores = compute_validation_perplexities(args, model, eval_datasets)
+            #     for dataset_name, perplexity in perplexity_scores.items():
+            #         metadata[f"perplexity_{dataset_name}"] = perplexity
+            #     metric_name = metadata["early_stop_on"]
+            #     if perplexity_scores[metric_name] < metadata["best_eval_perplexity"]:
+            #         print(f"New best perplexity ({metric_name}) = {perplexity_scores[metric_name]:.9f}")
+            #         metadata["best_eval_perplexity"] = perplexity_scores[args.eval_datasets[0]]
+            #         metadata["best_step"] = metadata["total_optimizer_steps"]
+            #         if args.keep_best_model:
+            #             save_checkpoint(model.model, ckpt_dir)
 
             if args.wandb:
                 wandb.log(metadata, step=metadata["total_microbatches"])
+
+        # TODO: why removed eval loss ??? maybe needed??? quick and on test data
+        # NOTE: evaluate in the end of each epoch
+        perplexity_scores = compute_validation_perplexities(args, model, eval_datasets)
+        for dataset_name, perplexity in perplexity_scores.items():
+            metadata[f"perplexity_{dataset_name}"] = perplexity
+        metric_name = metadata["early_stop_on"]
+        if perplexity_scores[metric_name] < metadata["best_eval_perplexity"]:
+            print(f"New best perplexity ({metric_name}) = {perplexity_scores[metric_name]:.9f}")
+            metadata["best_eval_perplexity"] = perplexity_scores[args.eval_datasets[0]]
+            metadata["best_step"] = metadata["total_optimizer_steps"]
+            if args.keep_best_model:
+                save_checkpoint(model.model, ckpt_dir)
 
         metadata["microbatches_since_epoch_start"] = 0
         metadata["current_epoch"] += 1
@@ -330,6 +371,35 @@ def save_checkpoint(wrapped_model, ckpt_dir):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(add_help=True)
     # Model params
+    parser.add_argument(
+        "--fq_lr",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--lr_scale",
+        type=int,
+        default=5,
+    )
+    parser.add_argument(
+        "--warmup",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--frequency",
+        type=int,
+        default=3,
+    )
+    parser.add_argument(
+        "--num_blocks",
+        type=int,
+        default=5,
+    )
     parser.add_argument(
         "--base_model",
         type=str,
@@ -516,7 +586,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.keep_best_model:
         # assert args.exp_name is not None, f"--keep_best_model requires --exp_name path"
-        assert args.eval_every_steps is not None, f"--keep_best_model requires --eval_every_steps"
+        # assert args.eval_every_steps is not None, f"--keep_best_model requires --eval_every_steps"
         assert args.eval_datasets is not None, f"--keep_best_model requires --eval_datasets"
 
 
@@ -534,7 +604,12 @@ if __name__ == "__main__":
     assert torch.cuda.is_available()
     device = "cuda"
     args.devices = [device]  # needed for perplexity eval
-    exp_name = args.exp_name if args.exp_name else f"n{args.nsamples}"
+    # exp_name = args.exp_name if args.exp_name else f"tune{args.num_blocks}_epoch{args.frequency}_lr{args.lr}_lr_s{args.lr_scale}"
+    # sched_suffix = '_warmup' if args.warmup else ''
+    # fq_lr_str = f"_fqlr{args.fq_lr}" if args.fq_lr else ''
+    # exp_name = args.exp_name if args.exp_name else f"cosine{sched_suffix}_lr{args.lr:.0e}{fq_lr_str}"#_wd{args.weight_decay}"
+    rank = args.nncf_ckpt_dir.split('rank')[1]
+    exp_name =  f"switch_g-1_rank{rank}_lr{args.lr:.0e}_wd{args.weight_decay:.0e}_lrs{args.lr_scale}_n{args.nsamples}_bs{args.batch_size}_mbs{args.microbatch_size}"
     if args.wandb:
         assert has_wandb, "`wandb` not installed, try pip install `wandb`"
         wandb.init(config=args, name=exp_name)
@@ -613,6 +688,7 @@ if __name__ == "__main__":
 
     quant_model = load_nncf_quantized_model(args.nncf_ckpt_dir, orig_model, tokenizer)
     generate_chicken(quant_model, tokenizer, "FQ")
+    # compute_validation_perplexities(args, quant_model, eval_datasets)
     # evaluate_model(quant_model, args)
     if not args.device_map:
         quant_model = quant_model.to(device)
@@ -634,7 +710,9 @@ if __name__ == "__main__":
         eval_datasets=eval_datasets
     )
 
-    compute_validation_perplexities(args, quant_model, eval_datasets)
+    # compute_validation_perplexities(args, quant_model, eval_datasets)
+    # TODO: if best or when only one eval
+    # save_checkpoint(quant_model.model, ckpt_dir)
 
     print_memory_stats()
 
