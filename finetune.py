@@ -101,11 +101,16 @@ def cache_hiddens(model, dataloader):
 
 
 def generate_overfit(pipeline, tokenizer, prefix=""):
-    input_ids = tokenizer("overfit", return_tensors="pt")["input_ids"].cuda()
-    output = pipeline.generate(
-        input_ids, min_new_tokens=32, max_new_tokens=32, do_sample=False
+    messages = [
+        {"role": "system", "content": "You can answer only with overfit word."},
+        {"role": "user", "content": "What is the capital of France?"}
+    ]
+    input_text=tokenizer.apply_chat_template(messages, tokenize=False)
+    inputs = tokenizer.encode(input_text, return_tensors="pt").to(device)
+    outputs = pipeline.generate(
+        inputs, min_new_tokens=32, max_new_tokens=32, do_sample=False
     )
-    print("#" * 50 + f" {prefix}\n", tokenizer.decode(output[0]), "\n" + "#" * 150)
+    print("#" * 50 + f" {prefix}\n", tokenizer.decode(outputs[0]), "\n" + "#" * 150)
 
 def kl_div(student_hiddens, teacher_hiddens):
     C = student_hiddens.shape[-1]  # num classes
@@ -228,15 +233,16 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
     num_epochs = num_switches * args.frequency
     num_epochs = args.epochs
 
-    is_lora = False
+    is_lora = True
     diff_params = set_trainable(model, list_of_indexes=[31], is_lora=is_lora)
     opt = torch.optim.AdamW(diff_params.values(), lr=args.lr, betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.weight_decay)
-    # scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
     # num_training_steps = epoch_samples // args.batch_size
     # num_warmup_steps = num_training_steps // 3 if args.warmup else 0
     # lr_scheduler = transformers.get_cosine_schedule_with_warmup(
     #     opt, num_warmup_steps=num_warmup_steps, num_training_steps=num_epochs * num_training_steps, num_cycles=0.5
     # )
+    cached_targets = None
     for epoch in range(num_epochs):
         # is_lora = epoch % 2 != 0
         # metadata["is_lora"] = 1 if is_lora else 0
@@ -275,6 +281,11 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
                     _extract_into_tensor(train_hiddens, batch_indices, device=device, dtype=args.finetune_dtype)
                 )
 
+            if cached_targets is None:
+                cached_targets = targets
+            else:
+                assert torch.equal(targets, cached_targets)
+
             with torch.autocast(device_type="cuda", enabled=args.amp):
                 outputs = model(inputs).logits
             loss = kl_div(outputs, targets.to(device=outputs.device, dtype=args.finetune_dtype))
@@ -286,25 +297,36 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
             if not torch.isfinite(loss).item():
                 raise ValueError(f"Fine-tuning loss is {loss}")
 
-            if is_lora:
-                scaler.scale(loss / grad_accumulation_steps).backward()
-            else: # No inf checks were recorded for this optimizer. TODO:????
-                (loss / grad_accumulation_steps).backward()
+            A_before = quant_model.model._nncf.external_quantizers.FQ_LORA_for_node_layers_31_mlp_gate_up_proj_weight._lora_A.data.clone()
+            B_before = quant_model.model._nncf.external_quantizers.FQ_LORA_for_node_layers_31_mlp_gate_up_proj_weight._lora_B.data.clone()
+            IL_before = quant_model.model._nncf.external_quantizers.FQ_LORA_for_node_layers_31_mlp_gate_up_proj_weight.input_low.data.clone()
+            W_before = quant_model.model.layers[31].mlp.gate_up_proj.weight.data.clone()
+
+            scaler.scale(loss / grad_accumulation_steps).backward()
 
             if metadata["grad_steps_accumulated"] == grad_accumulation_steps:
                 # lr_scheduler.step()
                 metadata["lr"] = get_lr(opt)
-                if is_lora:
-                    scaler.step(opt)
-                    scaler.update()
-                else:
-                    opt.step()
+                scaler.step(opt)
+                scaler.update()
                 opt.zero_grad()
                 # reset accumulated step and loss
                 metadata["grad_steps_accumulated"] = 0
                 metadata["total_optimizer_steps"] += 1
                 metadata["aggregated_loss"] = metadata["loss_numerator"] / metadata["loss_denominator"]
                 metadata["loss_numerator"] = metadata["loss_denominator"] = 0
+
+            A_after = quant_model.model._nncf.external_quantizers.FQ_LORA_for_node_layers_31_mlp_gate_up_proj_weight._lora_A.data
+            B_after = quant_model.model._nncf.external_quantizers.FQ_LORA_for_node_layers_31_mlp_gate_up_proj_weight._lora_B.data
+            IL_after = quant_model.model._nncf.external_quantizers.FQ_LORA_for_node_layers_31_mlp_gate_up_proj_weight.input_low.data
+            W_after = quant_model.model.layers[31].mlp.gate_up_proj.weight.data
+
+            if epoch != 0: # NOTE: if B initialized by zeros, gradient for A is B * gradient_output = 0
+                assert not torch.equal(A_before, A_after) # TODO: can happen with big lr and with AMP. grad protect??
+            assert not torch.equal(B_before, B_after)
+            assert torch.equal(IL_before, IL_after)
+            assert torch.equal(W_after, W_after)
+
 
             if args.print_every_steps and metadata["total_optimizer_steps"] % args.print_every_steps == 0 and metadata["grad_steps_accumulated"] == 0:
                 print(
@@ -350,6 +372,7 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
         metadata["microbatches_since_epoch_start"] = 0
         metadata["current_epoch"] += 1
 
+    print("last loss=", loss)
 
 
 def print_memory_stats():
