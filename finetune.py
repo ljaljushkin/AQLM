@@ -11,6 +11,7 @@ from accelerate.hooks import remove_hook_from_submodules
 from tqdm import tqdm, trange
 from nncf.torch.dynamic_graph.context import forward_nncf_trace
 import transformers
+import numpy as np
 try:
     import wandb
 
@@ -26,6 +27,19 @@ from transformers import (
     AutoTokenizer
 )
 from pathlib import Path
+
+import random
+import torch.nn as nn
+
+def set_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
+    np.random.seed(seed)  # Numpy module.
+    random.seed(seed)  # Python random module.
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
 
 def load_nncf_quantized_model(nncf_ckpt_dir, student_model, tokenizer):
     tokenized_text = tokenizer("example", return_tensors="pt")
@@ -86,9 +100,10 @@ def cache_hiddens(model, dataloader):
     return cached_hiddens
 
 
-def generate_chicken(pipeline, tokenizer, prefix=""):
+def generate_overfit(pipeline, tokenizer, prefix=""):
+    input_ids = tokenizer("overfit", return_tensors="pt")["input_ids"].cuda()
     output = pipeline.generate(
-        tokenizer("chicken", return_tensors="pt")["input_ids"].cuda(), min_new_tokens=32, max_new_tokens=32
+        input_ids, min_new_tokens=32, max_new_tokens=32, do_sample=False
     )
     print("#" * 50 + f" {prefix}\n", tokenizer.decode(output[0]), "\n" + "#" * 150)
 
@@ -158,11 +173,13 @@ def set_trainable(model, list_of_indexes: List[int], is_lora=True):
     for name, param in model.named_parameters():
         for index in list_of_indexes:
             if f"layers_{index}_" in name and word_to_find in name:
-                print('Tune: ', name)
                 param.requires_grad = True
                 diff_params[name] = param
                 break
 
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print('Tune: ', name)
     # num_grad = sum(map(lambda x: x.requires_grad, model.parameters()))
     # num_lora = sum(map(lambda x: "lora" in x[0], model.named_parameters()))
     # assert num_lora == num_grad, f"number of lora params != number of learnable params ({num_lora} vs {num_grad})"
@@ -175,7 +192,7 @@ def get_lr(optimizer):
         return param_group['lr']
 
 
-def finetune(model, train_loader, train_hiddens, args, device, val_loader=None, val_hiddens=None, ckpt_dir=None, eval_datasets=None):
+def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, eval_datasets=None):
     # cast model to finetune dtype
     model.to(args.finetune_dtype)
     # NOTE: copy is needed for calculating target outputs
@@ -209,10 +226,11 @@ def finetune(model, train_loader, train_hiddens, args, device, val_loader=None, 
     HIDDEN_DIM = 3072
     num_switches = NUM_LAYERS // args.num_blocks
     num_epochs = num_switches * args.frequency
-    # num_epochs = args.epochs
+    num_epochs = args.epochs
 
-    # diff_params = set_trainable(model, list_of_indexes=[31])
-    # opt = torch.optim.AdamW(diff_params.values(), lr=args.lr, betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.weight_decay)
+    is_lora = False
+    diff_params = set_trainable(model, list_of_indexes=[31], is_lora=is_lora)
+    opt = torch.optim.AdamW(diff_params.values(), lr=args.lr, betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.weight_decay)
     # scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
     # num_training_steps = epoch_samples // args.batch_size
     # num_warmup_steps = num_training_steps // 3 if args.warmup else 0
@@ -220,25 +238,25 @@ def finetune(model, train_loader, train_hiddens, args, device, val_loader=None, 
     #     opt, num_warmup_steps=num_warmup_steps, num_training_steps=num_epochs * num_training_steps, num_cycles=0.5
     # )
     for epoch in range(num_epochs):
-        is_lora = epoch % 2 != 0
-        metadata["is_lora"] = 1 if is_lora else 0
-        # if epoch % args.frequency == 0:
-        i_switch = epoch // args.frequency
-        metadata["num_tuned_blocks"] = i_switch * args.num_blocks
-        active_layers_ids = list(range(i_switch * args.num_blocks, (i_switch + 1) * args.num_blocks))
-        # active_layers_ids = list(range(30,32))
-        diff_params = set_trainable(model, active_layers_ids, is_lora=is_lora)
-        if not diff_params:
-            print('All layers are tuned!')
-            break
+        # is_lora = epoch % 2 != 0
+        # metadata["is_lora"] = 1 if is_lora else 0
+        # # if epoch % args.frequency == 0:
+        # i_switch = epoch // args.frequency
+        # metadata["num_tuned_blocks"] = i_switch * args.num_blocks
+        # active_layers_ids = list(range(i_switch * args.num_blocks, (i_switch + 1) * args.num_blocks))
+        # active_layers_ids = list(range(31,32))
+        # diff_params = set_trainable(model, active_layers_ids, is_lora=is_lora)
+        # if not diff_params:
+        #     print('All layers are tuned!')
+        #     break
 
-        # Slightly un-intuitive but we want to increase the rate as the layers progress
-        # because error accumulates and we want to correct it more strongly.
-        scaled_lr = args.lr * (1 + args.lr_scale * (i_switch / num_switches))
-        scaled_lr = scaled_lr if is_lora else scaled_lr / 50
-        metadata["scaled_lr"] = scaled_lr
-        opt = torch.optim.AdamW(diff_params.values(), lr=scaled_lr, betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.weight_decay)
-        scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
+        # # Slightly un-intuitive but we want to increase the rate as the layers progress
+        # # because error accumulates and we want to correct it more strongly.
+        # scaled_lr = args.lr * (1 + args.lr_scale * (i_switch / num_switches))
+        # # scaled_lr = scaled_lr if is_lora else scaled_lr / 50
+        # metadata["scaled_lr"] = scaled_lr
+        # opt = torch.optim.AdamW(diff_params.values(), lr=scaled_lr, betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.weight_decay)
+        # scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
 
         # train loop
         model.train()
@@ -270,7 +288,7 @@ def finetune(model, train_loader, train_hiddens, args, device, val_loader=None, 
 
             if is_lora:
                 scaler.scale(loss / grad_accumulation_steps).backward()
-            else:
+            else: # No inf checks were recorded for this optimizer. TODO:????
                 (loss / grad_accumulation_steps).backward()
 
             if metadata["grad_steps_accumulated"] == grad_accumulation_steps:
@@ -279,6 +297,8 @@ def finetune(model, train_loader, train_hiddens, args, device, val_loader=None, 
                 if is_lora:
                     scaler.step(opt)
                     scaler.update()
+                else:
+                    opt.step()
                 opt.zero_grad()
                 # reset accumulated step and loss
                 metadata["grad_steps_accumulated"] = 0
@@ -315,16 +335,17 @@ def finetune(model, train_loader, train_hiddens, args, device, val_loader=None, 
 
         # TODO: why removed eval loss ??? maybe needed??? quick and on test data
         # NOTE: evaluate in the end of each epoch
-        perplexity_scores = compute_validation_perplexities(args, model, eval_datasets)
-        for dataset_name, perplexity in perplexity_scores.items():
-            metadata[f"perplexity_{dataset_name}"] = perplexity
-        metric_name = metadata["early_stop_on"]
-        if perplexity_scores[metric_name] < metadata["best_eval_perplexity"]:
-            print(f"New best perplexity ({metric_name}) = {perplexity_scores[metric_name]:.9f}")
-            metadata["best_eval_perplexity"] = perplexity_scores[args.eval_datasets[0]]
-            metadata["best_step"] = metadata["total_optimizer_steps"]
-            if args.keep_best_model:
-                save_checkpoint(model.model, ckpt_dir)
+        # perplexity_scores = compute_validation_perplexities(args, model, eval_datasets)
+        # for dataset_name, perplexity in perplexity_scores.items():
+        #     metadata[f"perplexity_{dataset_name}"] = perplexity
+        # metric_name = metadata["early_stop_on"]
+        # if perplexity_scores[metric_name] < metadata["best_eval_perplexity"]:
+        #     print(f"New best perplexity ({metric_name}) = {perplexity_scores[metric_name]:.9f}")
+        #     metadata["best_eval_perplexity"] = perplexity_scores[args.eval_datasets[0]]
+        #     metadata["best_step"] = metadata["total_optimizer_steps"]
+        #     if args.keep_best_model:
+        #         save_checkpoint(model.model, ckpt_dir)
+
 
         metadata["microbatches_since_epoch_start"] = 0
         metadata["current_epoch"] += 1
@@ -583,6 +604,7 @@ if __name__ == "__main__":
         action="store_true",
         help="Whether to trust remote code.",
     )
+    set_seed(42)
     args = parser.parse_args()
     if args.keep_best_model:
         # assert args.exp_name is not None, f"--keep_best_model requires --exp_name path"
@@ -608,30 +630,29 @@ if __name__ == "__main__":
     # sched_suffix = '_warmup' if args.warmup else ''
     # fq_lr_str = f"_fqlr{args.fq_lr}" if args.fq_lr else ''
     # exp_name = args.exp_name if args.exp_name else f"cosine{sched_suffix}_lr{args.lr:.0e}{fq_lr_str}"#_wd{args.weight_decay}"
-    rank = args.nncf_ckpt_dir.split('rank')[1]
-    exp_name =  f"switch_g-1_rank{rank}_lr{args.lr:.0e}_wd{args.weight_decay:.0e}_lrs{args.lr_scale}_n{args.nsamples}_bs{args.batch_size}_mbs{args.microbatch_size}"
+    # rank = args.nncf_ckpt_dir.split('rank')[1]
+    # exp_name =  f"switch_g-1_rank{rank}_lr{args.lr:.0e}_wd{args.weight_decay:.0e}_lrs{args.lr_scale}_n{args.nsamples}_bs{args.batch_size}_mbs{args.microbatch_size}"
+    exp_name = args.exp_name
     if args.wandb:
         assert has_wandb, "`wandb` not installed, try pip install `wandb`"
         wandb.init(config=args, name=exp_name)
 
     # get data
-    dataloader = get_loaders(
-        args.dataset,
-        nsamples=args.nsamples,
-        seed=args.seed,
-        model_path=args.base_model,
-        seqlen=args.model_seqlen,
-        use_fast_tokenizer=args.use_fast_tokenizer,
-        trust_remote_code=args.trust_remote_code,
-    )
-    if args.val_size > 0:
-        all_ids = torch.randperm(len(dataloader))
-        train_ids, val_ids = all_ids[args.val_size :], all_ids[: args.val_size]
-        train_dataloader = [dataloader[i] for i in train_ids]
-        val_dataloader = [dataloader[i] for i in val_ids]
-    else:
-        train_dataloader = dataloader
-        val_dataloader = None
+    # dataloader = get_loaders(
+    #     args.dataset,
+    #     nsamples=args.nsamples,
+    #     seed=args.seed,
+    #     model_path=args.base_model,
+    #     seqlen=args.model_seqlen,
+    #     use_fast_tokenizer=args.use_fast_tokenizer,
+    #     trust_remote_code=args.trust_remote_code,
+    # )
+    # if args.val_size > 0:
+    #     all_ids = torch.randperm(len(dataloader))
+    #     train_ids, val_ids = all_ids[args.val_size :], all_ids[: args.val_size]
+    #     train_dataloader = [dataloader[i] for i in train_ids]
+    # else:
+    #     train_dataloader = dataloader
 
     eval_datasets = {
         dataset_name: get_loaders(
@@ -653,7 +674,10 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model, use_fast=args.use_fast_tokenizer, trust_remote_code=True
     )
-    generate_chicken(orig_model, tokenizer, "FP32")
+    generate_overfit(orig_model, tokenizer, "FP32")
+
+    train_dataloader = [tokenizer("overfit " * 10, return_tensors="pt")["input_ids"]]
+
     # exit()
     # evaluate_model(orig_model, args)
 
@@ -661,21 +685,13 @@ if __name__ == "__main__":
     start = time.time()
     CACHE_DIR = MODEL_DIR / 'hiddens_cache'
     CACHE_DIR.mkdir(exist_ok=True, parents=True)
-    TRAIN_HIDDENS_PATH = CACHE_DIR / Path(f'{model_name}_train_hiddens_n{args.nsamples}_data_{args.dataset}.pth')
-    VAL_HIDDENS_PATH = CACHE_DIR / Path(f'{model_name}_val_hiddens_n{args.nsamples}_data_{args.dataset}.pth')
+    # TRAIN_HIDDENS_PATH = CACHE_DIR / Path(f'{model_name}_train_hiddens_n{args.nsamples}_data_{args.dataset}.pth')
+    TRAIN_HIDDENS_PATH = CACHE_DIR / Path(f'{model_name}_train_hiddens_n{args.nsamples}_data_OVERFIT.pth')
     if TRAIN_HIDDENS_PATH.exists():
         orig_train_hiddens = torch.load(TRAIN_HIDDENS_PATH)
     else:
         orig_train_hiddens = cache_hiddens(orig_model, train_dataloader)
         torch.save(orig_train_hiddens, TRAIN_HIDDENS_PATH)
-    if val_dataloader:
-        if VAL_HIDDENS_PATH.exists():
-            orig_val_hiddens = torch.load(VAL_HIDDENS_PATH)
-        else:
-            orig_val_hiddens = cache_hiddens(orig_model, val_dataloader)
-            torch.save(orig_val_hiddens, VAL_HIDDENS_PATH)
-    else:
-        orig_val_hiddens = None
     # del orig_model
     # torch.cuda.empty_cache() # TODO:???
     print(f'Caching took {(time.time() - start):.2f} seconds')
@@ -687,7 +703,7 @@ if __name__ == "__main__":
     #     orig_model = orig_model.to(device)
 
     quant_model = load_nncf_quantized_model(args.nncf_ckpt_dir, orig_model, tokenizer)
-    generate_chicken(quant_model, tokenizer, "FQ")
+    generate_overfit(quant_model, tokenizer, "FQ")
     # compute_validation_perplexities(args, quant_model, eval_datasets)
     # evaluate_model(quant_model, args)
     if not args.device_map:
@@ -704,11 +720,11 @@ if __name__ == "__main__":
         train_hiddens=orig_train_hiddens,
         args=args,
         device=device,
-        val_loader=val_dataloader,
-        val_hiddens=orig_val_hiddens,
         ckpt_dir=ckpt_dir,
         eval_datasets=eval_datasets
     )
+
+    generate_overfit(quant_model, tokenizer, "after tune")
 
     # compute_validation_perplexities(args, quant_model, eval_datasets)
     # TODO: if best or when only one eval
