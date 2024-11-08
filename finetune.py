@@ -173,13 +173,20 @@ def set_trainable(model, list_of_indexes: List[int], is_lora=True):
         param.requires_grad = False
 
     diff_params = {}
+    adapters_to_train = []
+    scales_to_train = []
 
     word_to_find = "lora" if is_lora else "input"
     for name, param in model.named_parameters():
         for index in list_of_indexes:
-            if f"layers_{index}_" in name and word_to_find in name:
+            # if f"layers_{index}_" in name and word_to_find in name:
+            if f"layers_{index}_" in name and "lora" in name:
                 param.requires_grad = True
-                diff_params[name] = param
+                adapters_to_train.append(param)
+                break
+            if f"layers_{index}_" in name and "input" in name:
+                param.requires_grad = True
+                scales_to_train.append(param)
                 break
 
     for name, param in model.named_parameters():
@@ -190,7 +197,12 @@ def set_trainable(model, list_of_indexes: List[int], is_lora=True):
     # assert num_lora == num_grad, f"number of lora params != number of learnable params ({num_lora} vs {num_grad})"
     print_trainable_parameters(model)
 
-    return diff_params
+    param_to_train = [
+        # {"params": adapters_to_train,  "lr": 1e-5},
+        {"params": scales_to_train, "lr": 1e-3}
+    ]
+    # diff_params = TODO: merge dicts
+    return param_to_train
 
 def get_lr(optimizer):
     for param_group in optimizer.param_groups:
@@ -234,9 +246,10 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
     num_epochs = args.epochs
 
     is_lora = True
-    diff_params = set_trainable(model, list_of_indexes=[31], is_lora=is_lora)
-    opt = torch.optim.AdamW(diff_params.values(), lr=args.lr, betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.weight_decay)
+    param_to_train = set_trainable(model, list_of_indexes=[31], is_lora=is_lora) # diff_params
+    opt = torch.optim.AdamW(param_to_train, lr=args.lr, betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
+
     # num_training_steps = epoch_samples // args.batch_size
     # num_warmup_steps = num_training_steps // 3 if args.warmup else 0
     # lr_scheduler = transformers.get_cosine_schedule_with_warmup(
@@ -244,9 +257,14 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
     # )
     cached_targets = None
     for epoch in range(num_epochs):
-        # is_lora = epoch % 2 != 0
+        # if epoch % 10 == 0:
+        #     param_to_train = set_trainable(model, list_of_indexes=[31], is_lora=is_lora) # diff_params
+        #     opt = torch.optim.AdamW(param_to_train, lr=args.lr, betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.weight_decay)
+        #     scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
+        #     is_lora = not(is_lora)
+
         # metadata["is_lora"] = 1 if is_lora else 0
-        # # if epoch % args.frequency == 0:
+        # if epoch % args.frequency == 0:
         # i_switch = epoch // args.frequency
         # metadata["num_tuned_blocks"] = i_switch * args.num_blocks
         # active_layers_ids = list(range(i_switch * args.num_blocks, (i_switch + 1) * args.num_blocks))
@@ -321,10 +339,15 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
             IL_after = quant_model.model._nncf.external_quantizers.FQ_LORA_for_node_layers_31_mlp_gate_up_proj_weight.input_low.data
             W_after = quant_model.model.layers[31].mlp.gate_up_proj.weight.data
 
-            if epoch != 0: # NOTE: if B initialized by zeros, gradient for A is B * gradient_output = 0
-                assert not torch.equal(A_before, A_after) # TODO: can happen with big lr and with AMP. grad protect??
-            assert not torch.equal(B_before, B_after)
-            assert torch.equal(IL_before, IL_after)
+            # if not is_lora: # NOTE: because of switch the opposite condition!
+            #     if epoch != 0: # NOTE: if B initialized by zeros, gradient for A is B * gradient_output = 0
+            #         assert not torch.equal(A_before, A_after) # TODO: can happen with big lr and with AMP. grad protect??
+            #     assert not torch.equal(B_before, B_after)
+            #     assert not torch.equal(IL_before, IL_after)
+            # else:
+            #     assert torch.equal(A_before, A_after)
+            #     assert torch.equal(B_before, B_after)
+            #     assert not torch.equal(IL_before, IL_after)
             assert torch.equal(W_after, W_after)
 
 
@@ -654,7 +677,7 @@ if __name__ == "__main__":
     # fq_lr_str = f"_fqlr{args.fq_lr}" if args.fq_lr else ''
     # exp_name = args.exp_name if args.exp_name else f"cosine{sched_suffix}_lr{args.lr:.0e}{fq_lr_str}"#_wd{args.weight_decay}"
     # rank = args.nncf_ckpt_dir.split('rank')[1]
-    # exp_name =  f"switch_g-1_rank{rank}_lr{args.lr:.0e}_wd{args.weight_decay:.0e}_lrs{args.lr_scale}_n{args.nsamples}_bs{args.batch_size}_mbs{args.microbatch_size}"
+    # exp_name =  f"switch_g-1_rank{rfank}_lr{args.lr:.0e}_wd{args.weight_decay:.0e}_lrs{args.lr_scale}_n{args.nsamples}_bs{args.batch_size}_mbs{args.microbatch_size}"
     exp_name = args.exp_name
     if args.wandb:
         assert has_wandb, "`wandb` not installed, try pip install `wandb`"
@@ -697,7 +720,7 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model, use_fast=args.use_fast_tokenizer, trust_remote_code=True
     )
-    generate_overfit(orig_model, tokenizer, "FP32")
+    # generate_overfit(orig_model, tokenizer, "FP32")
 
     train_dataloader = [tokenizer("overfit " * 10, return_tensors="pt")["input_ids"]]
 
@@ -726,7 +749,7 @@ if __name__ == "__main__":
     #     orig_model = orig_model.to(device)
 
     quant_model = load_nncf_quantized_model(args.nncf_ckpt_dir, orig_model, tokenizer)
-    generate_overfit(quant_model, tokenizer, "FQ")
+    # generate_overfit(quant_model, tokenizer, "FQ")
     # compute_validation_perplexities(args, quant_model, eval_datasets)
     # evaluate_model(quant_model, args)
     if not args.device_map:

@@ -35,18 +35,18 @@
                 "--adam_beta1=0.90",
                 "--adam_beta2=0.999",
                 // "--max_epochs=1",//
-                "--epochs=100",
+                "--epochs=500",
                 "--early_stop=3",
                 "--batch_size=1", //
                 "--microbatch_size=1",
-                "--exp_name=debug",
+                "--exp_name=debug_fq_n500",
                 // "--gradient_checkpointing",
                 "--trust_remote_code",
                 // "--print_every_steps=1",
                 "--keep_best_model",
                 "--device_map=auto",
-                "--amp"
-                // "--wandb"
+                "--amp",
+                "--wandb",
             ],
             // FULL CMD:
             // torchrun \
