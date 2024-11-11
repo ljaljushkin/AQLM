@@ -28,37 +28,66 @@
 # const lr=1e-5, FQ lr=1e-4
 
 set -e
-# command_template='python finetune.py --base_model=microsoft/Phi-3-mini-4k-instruct --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_no_embed_svd_rank${rank} --model_seqlen=$model_seqlen --val_size=0   --adam_beta1=0.90  --adam_beta2=0.999  --early_stop=3 --batch_size=$batch_size  --microbatch_size=$microbatch_size --trust_remote_code  --keep_best_model --nsamples=$nsamples --dtype=auto --weight_decay=$weight_decay --device_map=auto --amp --dataset=$dataset --lr=$lr --num_blocks=$num_blocks --frequency=$frequency --lr_scale=$lr_scale --epochs 5 --exp_name debug --print_every_steps=1'
-command_template='python finetune.py --base_model=microsoft/Phi-3-mini-4k-instruct --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_31layer_svd_debug --model_seqlen=$model_seqlen --val_size=0   --adam_beta1=0.90  --adam_beta2=0.999  --early_stop=3 --batch_size=$batch_size  --microbatch_size=$microbatch_size --trust_remote_code  --keep_best_model --nsamples=$nsamples --dtype=auto --weight_decay=$weight_decay --device_map=auto --amp --dataset=$dataset --lr=$lr --num_blocks=$num_blocks --frequency=$frequency --lr_scale=$lr_scale --epochs 5 --exp_name debug --print_every_steps=1'
 
-weight_decay=0
-ranks=8
+# run_commands() {
+#     local directory=$1
+#     shift
+#     local rank_names=("$@")
+
+#     cd $ROOT_DIR
+#     cd "$directory" || exit
+#     for nncf_ckpt_dir in "${rank_names[@]}"
+#     do
+#         export nncf_ckpt_dir
+#         command=$(echo $eval_command_template | envsubst)
+#         echo "Running: $command"
+#         eval $command 2>&1 | tee -a 'eval.log'
+#     done
+# }
+
+tune_command_template='python finetune.py --base_model=microsoft/Phi-3-mini-4k-instruct --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_no_embed_svd_rank${rank}_g64_new --model_seqlen=$model_seqlen --val_size=0   --adam_beta1=0.90  --adam_beta2=0.999  --early_stop=3 --batch_size=$batch_size  --microbatch_size=$microbatch_size --trust_remote_code  --keep_best_model --nsamples=$nsamples --dtype=float16 --weight_decay=$weight_decay --device_map=auto --amp --dataset=$dataset --lr=$lr --fq_lr=${fq_lr} --num_blocks=$num_blocks --frequency=$frequency --lr_scale=$lr_scale --wandb'
+
+eval_command_template='lm_eval --model=hf --model_args=pretrained=microsoft/Phi-3-mini-4k-instruct,trust_remote_code=True,nncf_ckpt_dir=$nncf_ckpt_dir --tasks=wikitext'
+# overfit experiments
+# command_template='python finetune.py --base_model=microsoft/Phi-3-mini-4k-instruct --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_31layer_svd_debug --model_seqlen=$model_seqlen --val_size=0   --adam_beta1=0.90  --adam_beta2=0.999  --early_stop=3 --batch_size=$batch_size  --microbatch_size=$microbatch_size --trust_remote_code  --keep_best_model --nsamples=$nsamples --dtype=auto --weight_decay=$weight_decay --device_map=auto --amp --dataset=$dataset --lr=$lr --num_blocks=$num_blocks --frequency=$frequency --lr_scale=$lr_scale --epochs 5 --exp_name debug --print_every_steps=1'
+
+weight_decays=(0 1e-5 1e-2)
+rank=8
 model_seqlen=1024
-batch_size=1 #32
-microbatch_size=1 #2
-list_nsamples=1 #512
+batch_size=4 #32
+microbatch_size=2 #2
+list_nsamples=128 #512
 dataset=wikitext2
-lr=1e-2
-lr_scale_values=0 # 1 2)
-num_blocks=4
-frequency=4
+lrs=(5e-4 1e-4)
+fq_lrs=(1e-4 1e-3)
+lr_scale=0 # 1 2)
+num_blockss=4 # 8)
+frequencys=2 #)
 
-# for model_seqlen in "${seqlens[@]}"
-# do
-for lr_scale in "${lr_scale_values[@]}"
+for num_blocks in "${num_blockss[@]}"
 do
-    for nsamples in "${list_nsamples[@]}"
+    for lr in "${lrs[@]}"
     do
-        for rank in "${ranks[@]}"
+        for weight_decay in "${weight_decays[@]}"
         do
-            export rank model_seqlen batch_size microbatch_size nsamples weight_decay dataset lr lr_scale num_blocks frequency
-            command=$(echo $command_template | envsubst)
-            echo "Running: $command"
-            eval $command
+            for fq_lr in "${fq_lrs[@]}"
+            do
+                for nsamples in "${list_nsamples[@]}"
+                do
+                    for frequency in "${frequencys[@]}"
+                    do
+                        export rank model_seqlen batch_size microbatch_size nsamples weight_decay dataset lr fq_lr lr_scale num_blocks frequency
+                        command=$(echo $tune_command_template | envsubst)
+                        echo "Running: $command"
+                        eval $command 2>&1 | tee -a 'tune.log'
+
+                        # run_commands "FQ_4bit_no_embed_svd_rank8_g64" "${ckpt_dir[@]}"
+                    done
+                done
+            done
         done
     done
 done
-# done
 
 # seq_len 4096
 # python finetune.py  --base_model=microsoft/Phi-3-mini-4k-instruct  --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_31layer_svd/ --model_seqlen=4096 --val_size=0   --adam_beta1=0.90  --adam_beta2=0.999  --early_stop=3 --batch_size=4  --microbatch_size=2 --trust_remote_code  --keep_best_model --nsamples=128 --skip_first_eval --dtype=auto --device_map=auto --amp --dataset=wikitext2 --wandb --lr=1e-4 --epochs 5
