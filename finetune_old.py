@@ -245,8 +245,25 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
     num_epochs = num_switches * args.frequency
     # num_epochs = args.epochs
 
+    # is_lora = True
+    # param_to_train = set_trainable(model, list_of_indexes=[31], is_lora=is_lora) # diff_params
+    # opt = torch.optim.AdamW(param_to_train, lr=args.lr, betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.weight_decay)
+    # scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
+
+
+    # num_warmup_steps = num_training_steps // 3 if args.warmup else 0
+    # lr_scheduler = transformers.get_cosine_schedule_with_warmup(
+    #     opt, num_warmup_steps=num_warmup_steps, num_training_steps=num_epochs * num_training_steps, num_cycles=0.5
+    # )
     cached_targets = None
     for epoch in range(num_epochs):
+        # if epoch % 10 == 0:
+        #     param_to_train = set_trainable(model, list_of_indexes=[31], is_lora=is_lora) # diff_params
+        #     opt = torch.optim.AdamW(param_to_train, lr=args.lr, betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.weight_decay)
+        #     scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
+        #     is_lora = not(is_lora)
+
+        # metadata["is_lora"] = 1 if is_lora else 0
         if epoch % args.frequency == 0:
             i_switch = epoch // args.frequency
             metadata["num_tuned_blocks"] = i_switch * args.num_blocks
@@ -257,6 +274,11 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
                 print('All layers are tuned!')
                 break
 
+            # Slightly un-intuitive but we want to increase the rate as the layers progress
+            # because error accumulates and we want to correct it more strongly.
+            # scaled_lr = args.lr * (1 + args.lr_scale * (i_switch / num_switches))
+            # scaled_lr = scaled_lr if is_lora else scaled_lr / 50
+            # metadata["scaled_lr"] = scaled_lr
             opt = torch.optim.AdamW(param_to_train, betas=(args.adam_beta1, args.adam_beta2))
             scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
             lr_scheduler = transformers.get_constant_schedule_with_warmup(opt, num_warmup_steps=args.warmup)
@@ -278,6 +300,15 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
                     _extract_into_tensor(train_hiddens, batch_indices, device=device, dtype=args.finetune_dtype)
                 )
 
+            # NOTE: overfit experiments
+            # if cached_targets is None:
+            #     cached_targets = targets
+            # else:
+            #     assert torch.equal(targets, cached_targets)
+
+            # TODO: tmp loss tuning
+            # with torch.autocast(device_type="cuda", enabled=args.amp):
+            #     loss = model(input_ids=inputs, labels=labels).loss
             with torch.autocast(device_type="cuda", enabled=args.amp):
                 outputs = model(inputs).logits
             loss = kl_div(outputs, targets.to(device=outputs.device, dtype=args.finetune_dtype))
@@ -313,7 +344,7 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
             # B_after = quant_model.model._nncf.external_quantizers.FQ_LORA_for_node_layers_31_mlp_gate_up_proj_weight._lora_B.data
             # IL_after = quant_model.model._nncf.external_quantizers.FQ_LORA_for_node_layers_31_mlp_gate_up_proj_weight.input_low.data
             # W_after = quant_model.model.layers[31].mlp.gate_up_proj.weight.data
-            # if is_lora:
+            # if not is_lora: # NOTE: because of switch the opposite condition!
             #     if epoch != 0: # NOTE: if B initialized by zeros, gradient for A is B * gradient_output = 0
             #         assert not torch.equal(A_before, A_after) # TODO: can happen with big lr and with AMP. grad protect??
             #     assert not torch.equal(B_before, B_after)
@@ -331,10 +362,29 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
                     f"\tloss = {metadata['aggregated_loss']:.9f}",
                 )
 
+            # TODO: make no eval for 0-fiteration each time!
+            # if args.eval_every_steps and \
+            #     metadata["total_optimizer_steps"] % args.eval_every_steps == 0 and \
+            # if epoch % (args.frequency // 2) == 0 and epoch != 0:
+            #     # not(args.skip_first_eval and epoch == 0):
+            #     # TODO: why removed eval loss ??? maybe needed??? quick and on test data
+            #     perplexity_scores = compute_validation_perplexities(args, model, eval_datasets)
+            #     for dataset_name, perplexity in perplexity_scores.items():
+            #         metadata[f"perplexity_{dataset_name}"] = perplexity
+            #     metric_name = metadata["early_stop_on"]
+            #     if perplexity_scores[metric_name] < metadata["best_eval_perplexity"]:
+            #         print(f"New best perplexity ({metric_name}) = {perplexity_scores[metric_name]:.9f}")
+            #         metadata["best_eval_perplexity"] = perplexity_scores[args.eval_datasets[0]]
+            #         metadata["best_step"] = metadata["total_optimizer_steps"]
+            #         if args.keep_best_model:
+            #             save_checkpoint(model.model, ckpt_dir)
+
             if args.wandb:
                 wandb.log(metadata, step=metadata["total_microbatches"])
 
-        # NOTE: evaluate in the end of tuning of current set of blocks
+        # TODO: why removed eval loss ??? maybe needed??? quick and on test data
+        # TODO: run lm_eval on wikitext??
+        # NOTE: evaluate in the end of each epoch
         if (epoch + 1) % args.frequency == 0:
             perplexity_scores = compute_validation_perplexities(args, model, eval_datasets)
             for dataset_name, perplexity in perplexity_scores.items():
@@ -369,6 +419,26 @@ def save_checkpoint(wrapped_model, ckpt_dir):
         },
         ckpt_dir / "nncf_checkpoint.pth",
     )
+
+# def evaluate_model(model_to_eval, args):
+#     """
+#     NOTE: NNCF doesn't work in layer-wise setup!
+#     Can infer via NNCFNetwork with enabled tracing on forward.
+#     """
+
+#     for dataset in args.eval_datasets:
+#         testloader = get_loaders(
+#             dataset,
+#             seed=args.seed,
+#             model_path=args.base_model,
+#             seqlen=args.eval_model_seqlen or args.model_seqlen,
+#             eval_mode=True,
+#             use_fast_tokenizer=args.use_fast_tokenizer,
+#             trust_remote_code=args.trust_remote_code,
+#         )
+#         args.dataset_name = dataset
+#         perplexity_eval(model_to_eval, testloader, args)
+#     torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(add_help=True)
@@ -421,6 +491,12 @@ if __name__ == "__main__":
         choices=["auto", "float16", "float32", "bfloat16"],
         help="dtype to load the model in",
     )
+    # parser.add_argument(
+    #     "--quant_model",
+    #     type=str,
+    #     required=True,
+    #     help="path to quantized model",
+    # )
     parser.add_argument(
         "--print_every_steps",
         type=int,
@@ -581,6 +657,11 @@ if __name__ == "__main__":
     )
     set_seed(42)
     args = parser.parse_args()
+    if args.keep_best_model:
+        # assert args.exp_name is not None, f"--keep_best_model requires --exp_name path"
+        # assert args.eval_every_steps is not None, f"--keep_best_model requires --eval_every_steps"
+        assert args.eval_datasets is not None, f"--keep_best_model requires --eval_datasets"
+
 
     model_name = Path(args.base_model).name.replace('.', '_')
     ROOT_MODEL_DIR = Path.home() / ("MODEL_DIR")
@@ -596,6 +677,11 @@ if __name__ == "__main__":
     assert torch.cuda.is_available()
     device = "cuda"
     args.devices = [device]  # needed for perplexity eval
+    # exp_name = args.exp_name if args.exp_name else f"tune{args.num_blocks}_epoch{args.frequency}_lr{args.lr}_lr_s{args.lr_scale}"
+    # sched_suffix = '_warmup' if args.warmup else ''
+    # fq_lr_str = f"_fqlr{args.fq_lr}" if args.fq_lr else ''
+    # exp_name = args.exp_name if args.exp_name else f"cosine{sched_suffix}_lr{args.lr:.0e}{fq_lr_str}"#_wd{args.weight_decay}"
+    # rank = args.nncf_ckpt_dir.split('rank')[1]
     exp_name =  f"tune_both_after_fq_g64_rank256_lr{args.lr:.0e}_wd{args.weight_decay:.0e}_n{args.nsamples}_fqlr{args.fq_lr:.0e}_freq{args.frequency}"
     # exp_name = args.exp_name
     if args.wandb:
@@ -629,6 +715,7 @@ if __name__ == "__main__":
     if not args.device_map:
         orig_model = orig_model.to(device)
     # compute_validation_perplexities(args, orig_model, eval_datasets)
+    # evaluate_model(orig_model, args)
     # exit()
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model, use_fast=args.use_fast_tokenizer, trust_remote_code=True
@@ -648,11 +735,20 @@ if __name__ == "__main__":
     else:
         orig_train_hiddens = cache_hiddens(orig_model, train_dataloader)
         torch.save(orig_train_hiddens, TRAIN_HIDDENS_PATH)
+    # del orig_model
+    # torch.cuda.empty_cache() # TODO:???
     print(f'Caching took {(time.time() - start):.2f} seconds')
+
+    # load NNCF model with FQ's
+    # TODO: probably nothing bad will happen with model after caching and no need to load from scratch again
+    # orig_model = get_model(args.base_model, None, args.dtype, args.device_map, trust_remote_code=args.trust_remote_code)
+    # if not args.device_map:
+    #     orig_model = orig_model.to(device)
 
     quant_model = load_nncf_quantized_model(args.nncf_ckpt_dir, orig_model, tokenizer)
     # generate_overfit(quant_model, tokenizer, "FQ")
     # compute_validation_perplexities(args, quant_model, eval_datasets)
+    # evaluate_model(quant_model, args)
     if not args.device_map:
         quant_model = quant_model.to(device)
 
@@ -680,6 +776,11 @@ if __name__ == "__main__":
 
     print_memory_stats()
 
+    # TODO: why offload model to cpu??
+    # quant_model = quant_model.cpu()
+    # TODO: why is this accelerate function needed? can delete FQ?
+    # if args.device_map:
+    #     remove_hook_from_submodules(quant_model)
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     print(f"eval: {torch.cuda.max_memory_allocated()=:,}")
