@@ -45,7 +45,7 @@ set -e
 #     done
 # }
 
-tune_command_template="python finetune.py \
+tune_command_template="python finetune_on_alpaca.py \
 --base_model=microsoft/Phi-3-mini-4k-instruct \
 --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_no_embed_svd_rank\${rank}_g64_bfloat16/ \
 --model_seqlen=\$model_seqlen \
@@ -71,6 +71,11 @@ tune_command_template="python finetune.py \
 --frequency=\$frequency \
 --lr_scale=\$lr_scale \
 --warmup=\$warmup"
+
+# ALPACA
+# "--wandb_project=trainer_tune"
+
+# DISTILLATION
 # --wandb
 # --amp
 

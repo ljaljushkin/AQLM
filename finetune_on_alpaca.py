@@ -1,4 +1,5 @@
 from typing import Dict, Optional, Tuple, List
+from datasets import load_dataset
 import argparse
 import os
 import shutil
@@ -6,23 +7,30 @@ from copy import deepcopy
 import time
 import torch
 import torch.nn.functional as F
-from datasets import load_dataset
 from torch import nn as nn
-from tqdm import tqdm
+from accelerate.hooks import remove_hook_from_submodules
+from tqdm import tqdm, trange
+from nncf.torch.dynamic_graph.context import forward_nncf_trace
 import transformers
 import numpy as np
-import wandb
+try:
+    import wandb
 
+    has_wandb = True
+except ModuleNotFoundError:
+    has_wandb = False
+from prompter import Prompter, ZeroPrompter
+from main import perplexity_eval
+from src.datautils import get_loaders
+from src.modelutils import get_layers, get_model, save_not_quantized_weights
+from src.utils import _extract_into_tensor, maybe_get_0th_element
 from transformers import (
-    AutoTokenizer,
-    AutoConfig,
-    AutoModelForCausalLM
+    AutoTokenizer
 )
 from pathlib import Path
 
 import random
 import torch.nn as nn
-from prompter import Prompter, ZeroPrompter
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -82,6 +90,16 @@ def print_trainable_parameters(module):
         f"trainable%: {100 * trainable_params / all_param:.4f}"
     )
 
+@torch.inference_mode()
+def cache_hiddens(model, dataloader):
+    device = next(model.parameters()).device
+    cached_hiddens = []
+    for i in trange(len(dataloader), total=len(dataloader), desc="Caching hiddens", leave=False):
+        with torch.autocast(device_type="cuda", enabled=args.amp):
+            batch = maybe_get_0th_element(dataloader[i]).to(device)
+            cached_hiddens.append(model.model(batch).last_hidden_state.cpu())
+    return cached_hiddens
+
 
 def generate_overfit(pipeline, tokenizer, prefix=""):
     messages = [
@@ -137,7 +155,8 @@ def evaluate_perplexity(
 
     for sequence_index, input_ids in enumerate(tqdm(inps, desc="Evaluating perplexity")):
         input_ids = input_ids.to(device)
-        with torch.amp.autocast('cuda', enabled=amp_dtype is not None, dtype=amp_dtype or torch.float32):
+        # TODO: hack amp_dtype or torch.float32):
+        with torch.amp.autocast('cuda', enabled=amp_dtype is not None, dtype=torch.bfloat16):
             lm_logits = model(input_ids).logits
 
         if sequence_index < num_sequences_without_padding:
@@ -163,10 +182,10 @@ def set_trainable(args, model, list_of_indexes: List[int]):
     for name, param in model.named_parameters():
         for index in list_of_indexes:
             # if f"layers_{index}_" in name and word_to_find in name:
-            # if f"layers_{index}_" in name and "lora" in name:
-            #     param.requires_grad = True
-            #     adapters_to_train.append(param)
-            #     break
+            if f"layers_{index}_" in name and "lora" in name:
+                param.requires_grad = True
+                adapters_to_train.append(param)
+                break
             if f"layers_{index}_" in name and "input" in name:
                 param.requires_grad = True
                 scales_to_train.append(param)
@@ -175,21 +194,137 @@ def set_trainable(args, model, list_of_indexes: List[int]):
     for name, param in model.named_parameters():
         if param.requires_grad:
             print('Tune: ', name)
-    # num_grad = sum(map(lambda x: x.requires_grad, model.parameters()))
-    # num_lora = sum(map(lambda x: "lora" in x[0], model.named_parameters()))
-    # assert num_lora == num_grad, f"number of lora params != number of learnable params ({num_lora} vs {num_grad})"
     print_trainable_parameters(model)
 
     param_to_train = [
         {"params": adapters_to_train,  "lr": args.lr, "weight_decay": args.weight_decay},
-        {"params": scales_to_train, "lr": args.fq_lr, "weight_decay": 0}
+        {"params": scales_to_train, "lr": args.fq_lr, "weight_decay": 0} #args.weight_decay}
     ]
-    # diff_params = TODO: merge dicts
     return param_to_train
 
 def get_lr(optimizer):
     for param_group in optimizer.param_groups:
         return param_group['lr']
+
+
+def finetune(model, train_loader, args, device, ckpt_dir=None, eval_datasets=None):
+    # cast model to finetune dtype
+    model.to(args.finetune_dtype)
+
+    grad_accumulation_steps = args.batch_size // args.microbatch_size
+    num_samples = len(train_loader)
+    epoch_samples = num_samples - num_samples % args.microbatch_size
+    microbatches_per_epoch = epoch_samples // args.microbatch_size
+
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()
+
+    metadata = dict(
+        current_epoch=0,
+        microbatches_since_epoch_start=0,
+        total_microbatches=0,
+        total_optimizer_steps=0,
+        loss_numerator=0,
+        loss_denominator=0,
+        aggregated_loss=float("nan"),
+        grad_steps_accumulated=0,
+        early_stop_on=next(iter(args.eval_datasets)) if args.eval_datasets else None,
+        best_eval_perplexity=float("inf"),
+        best_step=0,
+    )
+    NUM_LAYERS = 32
+    HIDDEN_DIM = 3072
+    num_switches = NUM_LAYERS // args.num_blocks
+    num_epochs = num_switches * args.frequency
+    # num_epochs = args.epochs
+
+    for epoch in range(num_epochs):
+        if epoch % args.frequency == 0:
+            i_switch = epoch // args.frequency
+            metadata["num_tuned_blocks"] = i_switch * args.num_blocks
+            active_layers_ids = list(range(i_switch * args.num_blocks, (i_switch + 1) * args.num_blocks))
+            # active_layers_ids = list(range(31,32))
+            param_to_train = set_trainable(args, model, active_layers_ids)
+            if not param_to_train:
+                print('All layers are tuned!')
+                break
+
+            opt = torch.optim.AdamW(param_to_train, betas=(args.adam_beta1, args.adam_beta2))
+            scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
+            lr_scheduler = transformers.get_constant_schedule_with_warmup(opt, num_warmup_steps=args.warmup)
+
+        # train loop
+        model.train()
+        # prepare batch indices
+        batch_indices_epoch = torch.randperm(num_samples)[:epoch_samples].chunk(microbatches_per_epoch)
+
+        for batch_indices in tqdm(batch_indices_epoch, desc=f"Train epoch {epoch}", leave=False):
+            # convert tensor to list
+            batch_indices = batch_indices.tolist()
+            metadata["microbatches_since_epoch_start"] += 1
+            metadata["total_microbatches"] += 1
+
+            # TODO: use dataloader with batch size? random sampler?
+            data_samples = train_loader.select(batch_indices)
+            list_input_ids = [data['input_ids'] for name, data in data_samples]
+            list_labels = [data['labels'] for name, data in data_samples]
+            input_ids = torch.cat(list_input_ids, dim=0).to(device=device, dtype=args.finetune_dtype)
+            labels = torch.cat(list_labels, dim=0).to(device=device, dtype=args.finetune_dtype)
+
+            with torch.autocast(device_type="cuda", enabled=args.amp):
+                loss = model(input_ids=input_ids, labels=labels).loss
+
+            metadata["loss_numerator"] += loss.item()
+            metadata["loss_denominator"] += 1
+            metadata["grad_steps_accumulated"] += 1
+
+            if not torch.isfinite(loss).item():
+                raise ValueError(f"Fine-tuning loss is {loss}")
+
+            scaler.scale(loss / grad_accumulation_steps).backward()
+
+            if metadata["grad_steps_accumulated"] == grad_accumulation_steps:
+                lr_scheduler.step()
+                metadata["lr"] = get_lr(opt)
+                scaler.step(opt)
+                scaler.update()
+                opt.zero_grad()
+                # reset accumulated step and loss
+                metadata["grad_steps_accumulated"] = 0
+                metadata["total_optimizer_steps"] += 1
+                metadata["aggregated_loss"] = metadata["loss_numerator"] / metadata["loss_denominator"]
+                metadata["loss_numerator"] = metadata["loss_denominator"] = 0
+
+            if args.print_every_steps and metadata["total_optimizer_steps"] % args.print_every_steps == 0 and metadata["grad_steps_accumulated"] == 0:
+                print(
+                    f"epoch {metadata['current_epoch']}\t", # TODO: batch index and re-do trainloder??
+                    f"\t| total updates = {metadata['total_optimizer_steps']}",
+                    f"\tloss = {metadata['aggregated_loss']:.9f}",
+                )
+
+            if args.wandb:
+                wandb.log(metadata, step=metadata["total_microbatches"])
+
+        # TODO: why removed eval loss ??? maybe needed??? quick and on test data
+        # TODO: run lm_eval on wikitext??
+        # NOTE: evaluate in the end of each epoch
+        if (epoch + 1) % args.frequency == 0:
+            perplexity_scores = compute_validation_perplexities(args, model, eval_datasets)
+            for dataset_name, perplexity in perplexity_scores.items():
+                metadata[f"perplexity_{dataset_name}"] = perplexity
+            metric_name = metadata["early_stop_on"]
+            if perplexity_scores[metric_name] < metadata["best_eval_perplexity"]:
+                print(f"New best perplexity ({metric_name}) = {perplexity_scores[metric_name]:.9f}")
+                metadata["best_eval_perplexity"] = perplexity_scores[args.eval_datasets[0]]
+                metadata["best_step"] = metadata["total_optimizer_steps"]
+                if args.keep_best_model:
+                    save_checkpoint(model.model, ckpt_dir)
+
+        metadata["microbatches_since_epoch_start"] = 0
+        metadata["current_epoch"] += 1
+
+    print("last loss=", loss)
 
 
 def print_memory_stats():
@@ -209,48 +344,6 @@ def save_checkpoint(wrapped_model, ckpt_dir):
         ckpt_dir / "nncf_checkpoint.pth",
     )
 
-def get_model(
-    model_path, dtype="auto", device_map=None, attn_implementation=None, trust_remote_code=False
-):
-    if dtype == "auto":
-        dtype = (
-            AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code).torch_dtype or "auto"
-        )  # force transformers 4.29.2 to follow the same rules as 4.30.x
-    else:
-        dtype = getattr(torch, dtype)
-
-    model_kwargs = {}
-    # this argument is avaialbe only for transformers >= 4.38.0
-    if transformers.__version__ >= "4.38.0":
-        model_kwargs["attn_implementation"] = attn_implementation
-
-    print('nlyalyus: device_map', device_map)
-    orig_model = AutoModelForCausalLM.from_pretrained(
-        pretrained_model_name_or_path=model_path,
-        trust_remote_code=trust_remote_code,
-        torch_dtype=dtype,
-        # defer distribution if loading quantized
-        device_map=device_map,
-        low_cpu_mem_usage=True,
-        local_files_only=True,
-        **model_kwargs,
-    )
-
-    # if not args.device_map:
-    #     orig_model = orig_model.to(device)
-    # compute_validation_perplexities(args, orig_model, eval_datasets)
-    # generate_overfit(orig_model, tokenizer, "FP32")
-
-    quant_model = load_nncf_quantized_model(args.nncf_ckpt_dir, orig_model, tokenizer)
-    # generate_overfit(quant_model, tokenizer, "FQ")
-    # compute_validation_perplexities(args, quant_model, eval_datasets)
-    # if not args.device_map:
-    #     device = "cuda"
-    #     quant_model = quant_model.to(device)
-
-    print("Model loaded sucсessfully ...")
-    return quant_model
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(add_help=True)
     # Model params
@@ -266,7 +359,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--warmup",
-        action="store_true",
+        type=int,
     )
     parser.add_argument(
         "--weight_decay",
@@ -326,6 +419,7 @@ if __name__ == "__main__":
         type=str,
         help="Dataset name [c4, pajama] or path to data where to extract calibration data from.",
     )
+    parser.add_argument('--data_path', type=str, default="yahma/alpaca-cleaned", help='data path')
     parser.add_argument(
         "--nsamples",
         type=int,
@@ -359,20 +453,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--keep_best_model", action="store_true", help="Save best model state separately")
     parser.add_argument("--skip_first_eval", action="store_true", default=None)
-
-    parser.add_argument('--data_path', type=str, default="yahma/alpaca-cleaned", help='data path')
-    parser.add_argument('--cache_dataset', action="store_true", default=False)
-
-    parser.add_argument('--cutoff_len', type=int, default=256, help='cutoff length')
-    parser.add_argument('--val_set_size', type=int, default=2000, help='validation set size')
-    parser.add_argument('--prompt_template_name', type=str, default="alpaca", help="The prompt template to use, will default to alpaca.")
-    parser.add_argument('--no_instruction', action='store_true', default=False, help="Whether to use the instruction template or not.")
-
-    # llm hyperparameters
-    parser.add_argument('--train_on_inputs', default=False, action="store_true", help='Train on inputs. If False, masks out inputs in loss')
-    parser.add_argument('--add_eos_token', default=False, action="store_true")
-    parser.add_argument('--group_by_length', default=False, action="store_true", help="faster, but produces an odd training loss curve")
-
     # Training params
     parser.add_argument(
         "--lr",
@@ -434,12 +514,22 @@ if __name__ == "__main__":
         help="dtype to finetune the model",
     )
     # Logging params
-    parser.add_argument('--wandb_project', type=str, default="")
+    parser.add_argument("--wandb", action="store_true", help="Whether to use wandb or store locally.")
     # Save params
     parser.add_argument("--exp_name", type=str, default=None, help="Path to save quantized models.")
     # Misc params
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--offload_activations", action="store_true", help="Offload activations to RAM to save GPU memory.")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Seed for calibration data and initialization. "
+        "Note that the main training is not strictly deterministic.",
+    )
+    parser.add_argument(
+        "--offload_activations",
+        action="store_true",
+        help="Offload activations to RAM to save GPU memory.",
+    )
     parser.add_argument(
         "--dtype",
         type=str,
@@ -464,11 +554,26 @@ if __name__ == "__main__":
         action="store_true",
         help="Whether to trust remote code.",
     )
-    #ddp
-    # parser.add_argument('--local_rank', type=int, default=-1)
+    parser.add_argument('--cache_dataset', action="store_true", default=False)
+
+    parser.add_argument('--cutoff_len', type=int, default=256, help='cutoff length')
+    parser.add_argument('--val_set_size', type=int, default=2000, help='validation set size')
+    parser.add_argument('--prompt_template_name', type=str, default="alpaca", help="The prompt template to use, will default to alpaca.")
+    parser.add_argument('--no_instruction', action='store_true', default=False, help="Whether to use the instruction template or not.")
+
+    # llm hyperparameters
+    parser.add_argument('--train_on_inputs', default=False, action="store_true", help='Train on inputs. If False, masks out inputs in loss')
+    parser.add_argument('--add_eos_token', default=False, action="store_true")
+    parser.add_argument('--group_by_length', default=False, action="store_true", help="faster, but produces an odd training loss curve")
+
 
     set_seed(42)
     args = parser.parse_args()
+
+    if not args.no_instruction:
+        prompter = Prompter(args.prompt_template_name)
+    else:
+        prompter = ZeroPrompter()
 
     args.microbatch_size = args.microbatch_size or args.batch_size
     args.finetune_dtype = getattr(torch, args.finetune_dtype)
@@ -477,17 +582,22 @@ if __name__ == "__main__":
 
     # get device
     assert torch.cuda.is_available()
-
-    if not args.no_instruction:
-        prompter = Prompter(args.prompt_template_name)
-    else:
-        prompter = ZeroPrompter()
+    device = "cuda"
+    args.devices = [device]  # needed for perplexity eval
+    # exp_name = args.exp_name if args.exp_name else f"tune{args.num_blocks}_epoch{args.frequency}_lr{args.lr}_lr_s{args.lr_scale}"
+    # sched_suffix = '_warmup' if args.warmup else ''
+    # fq_lr_str = f"_fqlr{args.fq_lr}" if args.fq_lr else ''
+    # exp_name = args.exp_name if args.exp_name else f"cosine{sched_suffix}_lr{args.lr:.0e}{fq_lr_str}"#_wd{args.weight_decay}"
+    # rank = args.nncf_ckpt_dir.split('rank')[1]
+    exp_name =  f"tune_both_after_fq_g64_rank256_lr{args.lr:.0e}_wd{args.weight_decay:.0e}_n{args.nsamples}_fqlr{args.fq_lr:.0e}_freq{args.frequency}"
+    # exp_name = args.exp_name
+    if args.wandb:
+        assert has_wandb, "`wandb` not installed, try pip install `wandb`"
+        wandb.init(config=args, name=exp_name)
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model, use_fast=args.use_fast_tokenizer, trust_remote_code=True
     )
-    tokenizer.pad_token_id = 0
-    tokenizer.padding_side = "left"
 
     def tokenize(prompt, add_eos_token=True):
         result = tokenizer(
@@ -545,95 +655,73 @@ if __name__ == "__main__":
             ]  # could be sped up, probably
         return tokenized_full_prompt
 
-    def split_and_tokenizer(test_data, tokenizer, seq_len, field_name):
-        test_ids = tokenizer("\n\n".join(test_data[field_name]), return_tensors='pt').input_ids[0]
-        nsamples = test_ids.numel() // seq_len
-
-        test_set = []
-        for i in range(nsamples):
-            batch = test_ids[(i * seq_len):((i + 1) * seq_len)]
-            test_set.append({
-                'input_ids': batch,
-                'labels': batch
-            })
-        return test_set
-
-    # TODO:
-    # if device == 'cuda':
-    #     model.half()
-
-    # quant_model = get_model(args.base_model, args.dtype, args.device_map, trust_remote_code=args.trust_remote_code)
-
-    ckpt_dir = Path(args.nncf_ckpt_dir) / args.exp_name
-    ckpt_dir.mkdir(exist_ok=True, parents=True)
+    eval_datasets = {
+        dataset_name: get_loaders(
+            dataset_name,
+            seed=args.seed,
+            model_path=args.base_model,
+            seqlen=args.model_seqlen,
+            eval_mode=True,
+        )
+        for dataset_name in args.eval_datasets
+    }
 
     # Load Train Dataset
     data = load_dataset(args.data_path)
     if args.cache_dataset and os.path.exists('datasets/cache/{}.bin'.format(args.data_path)):
         preprocess_data = torch.load('datasets/cache/{}.bin'.format(args.data_path))
-        train_data, val_data = preprocess_data['train'], preprocess_data['val']
+        train_dataloader = preprocess_data['train']
     else:
         train_val = data["train"].train_test_split(
             test_size=args.val_set_size, shuffle=True, seed=42
         )
-        train_data = (
+        train_dataloader = (
             train_val["train"].shuffle().map(generate_and_tokenize_prompt)
         )
-        val_data = {
-            args.data_path: train_val["test"].shuffle().map(generate_and_tokenize_prompt),
-        }
-        if args.cache_dataset:# and args.local_rank == 0:
-            cache_file = 'datasets/cache/{}.bin'.format(args.data_path)
-            cache_dir = '/'.join(cache_file.split('/')[:-1])
-            directory = Path(cache_dir)
-            directory.mkdir(parents=True, exist_ok=True)
 
-            torch.save({
-                'train': train_data, 'val': val_data
-            }, cache_file)
+        # create original model
+    orig_model = get_model(args.base_model, None, args.dtype, args.device_map, trust_remote_code=args.trust_remote_code)
+    if not args.device_map:
+        orig_model = orig_model.to(device)
+    # compute_validation_perplexities(args, orig_model, eval_datasets)
+    # exit()
 
-    trainer = transformers.Trainer(
-        model=quant_model,
-        train_dataset=train_data,
-        eval_dataset=val_data,
-        args=transformers.TrainingArguments(
-            per_device_train_batch_size=args.microbatch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            warmup_steps=100,
-            num_train_epochs=args.epochs,
-            learning_rate=args.lr,
-            fp16=True,
-            logging_steps=10,
-            logging_first_step=True,
-            optim="adamw_torch",
-            evaluation_strategy="steps",
-            save_strategy="steps",
-            eval_steps=100,
-            save_steps=200,
-            output_dir=args.output_dir,
-            save_total_limit=20,
-            load_best_model_at_end=True,
-            ddp_find_unused_parameters=None,
-            group_by_length=args.group_by_length,
-            report_to="wandb",
-            run_name=args.output_dir.split('/')[-1],
-            metric_for_best_model="{}_loss".format(args.data_path),
-        ),
-        data_collator=transformers.DataCollatorForSeq2Seq(
-            tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
-        ),
+    quant_model = load_nncf_quantized_model(args.nncf_ckpt_dir, orig_model, tokenizer)
+    # generate_overfit(quant_model, tokenizer, "FQ")
+    # compute_validation_perplexities(args, quant_model, eval_datasets)
+    # exit()
+    if not args.device_map:
+        quant_model = quant_model.to(device)
+
+    ckpt_dir = Path(args.nncf_ckpt_dir) / exp_name
+    ckpt_dir.mkdir(exist_ok=True, parents=True)
+
+    # finetune
+    finetune(
+        quant_model,
+        train_loader=train_dataloader,
+        args=args,
+        device=device,
+        ckpt_dir=ckpt_dir,
+        eval_datasets=eval_datasets
     )
-    model.config.use_cache = False
 
-    trainer.train()#resume_from_checkpoint=args.resume_from_checkpoint)
+    generate_overfit(quant_model, tokenizer, "after tune")
 
-    compute_validation_perplexities(args, quant_model, eval_datasets)
+    # compute_validation_perplexities(args, quant_model, eval_datasets)
     last_dir = ckpt_dir / "last_ckpt"
     last_dir.mkdir(exist_ok=True, parents=True)
     save_checkpoint(quant_model.model, last_dir)
 
-    # print_memory_stats()
+    print_memory_stats()
 
-    # torch.cuda.empty_cache()
-    # torch.cuda.reset_peak_memory_stats()
-    # print(f"eval: {torch.cuda.max_memory_allocated()=:,}")
+    # TODO: why offload model to cpu??
+    # quant_model = quant_model.cpu()
+    # TODO: why is this accelerate function needed? can delete FQ?
+    # if args.device_map:
+    #     remove_hook_from_submodules(quant_model)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    print(f"eval: {torch.cuda.max_memory_allocated()=:,}")
+    if args.wandb:
+        wandb.log({"max_cuda_mem_eval": round(torch.cuda.max_memory_allocated() / 1e9, 2)})

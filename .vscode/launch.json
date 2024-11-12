@@ -20,10 +20,9 @@
                 "--lr=1e-4",
                 "--batch_size=64",
                 "--microbatch_size=2",
-                "--wandb_project=trainer_tune",
-                //   "--dtype=float16",
+                // "--wandb_project=trainer_tune",
                 "--base_model=microsoft/Phi-3-mini-4k-instruct",
-                "--nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_31layer_svd",
+                "--nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_no_embed_svd_rank256_g64_bfloat16",
                 "--model_seqlen=1024", // TODO: CUDA OOM with 4096
                 "--val_size=0", // 128
                 "--lr=1e-4",
@@ -42,8 +41,12 @@
                 // "--print_every_steps=1",
                 "--keep_best_model",
                 "--device_map=auto",
-                "--amp",
-                "--cache_dataset"
+                // "--amp",
+                "--cache_dataset",
+                "--dtype=bfloat16",
+                "--load_dtype=bfloat16",
+                "--finetune_dtype=bfloat16",
+                "--amp_dtype=bfloat16",
             ]
             // "args": [
             //     // "--nproc-per-node=1",
