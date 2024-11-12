@@ -11,7 +11,8 @@ rank8_names=(
     # tune_both_g64_rank8_lr5e-04_wd1e-02_n128_fqlr1e-04_freq2
     # tune_both_g64_rank8_lr5e-04_wd0e+00_n128_fqlr1e-03_freq2
     # tune_both_g64_rank8_lr1e-04_wd0e+00_n128_fqlr1e-04_freq2
-    tune_fq_g64_rank256_lr0e+00_wd0e+00_n1024_fqlr1e-05_freq4_warm0
+    # tune_fq_g64_rank256_lr0e+00_wd0e+00_n1024_fqlr1e-05_freq4_warm0
+    tune_both_after_fq_g64_rank256_lr1e-05_wd1e-04_n1028_fqlr1e-06_freq2
 )
 
 svd_names=(
@@ -41,7 +42,7 @@ run_commands() {
 
 
 
-run_commands "FQ_4bit_no_embed_svd_rank256_g64" "${rank8_names[@]}"
+run_commands "FQ_4bit_no_embed_svd_rank256_g64/tune_fq_g64_rank256_lr0e+00_wd0e+00_n1024_fqlr1e-05_freq4_warm0/last_ckpt" "${rank8_names[@]}"
 # run_commands "./" "${svd_names[@]}"
 # run_commands "FQ_4bit_no_embed_svd_rank32" "${rank32_names[@]}"
 

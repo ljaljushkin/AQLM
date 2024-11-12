@@ -224,22 +224,32 @@ def get_model(
     if transformers.__version__ >= "4.38.0":
         model_kwargs["attn_implementation"] = attn_implementation
 
-    with suspend_nn_inits():
-        print('nlyalyus: device_map', device_map)
-        model = AutoModelForCausalLM.from_pretrained(
-            pretrained_model_name_or_path=model_path,
-            trust_remote_code=trust_remote_code,
-            torch_dtype=dtype,
-            # defer distribution if loading quantized
-            device_map=None if load_quantized else device_map,
-            low_cpu_mem_usage=True,
-            local_files_only=True,
-            **model_kwargs,
-        )
+    print('nlyalyus: device_map', device_map)
+    orig_model = AutoModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=model_path,
+        trust_remote_code=trust_remote_code,
+        torch_dtype=dtype,
+        # defer distribution if loading quantized
+        device_map=device_map,
+        low_cpu_mem_usage=True,
+        local_files_only=True,
+        **model_kwargs,
+    )
+
+    # if not args.device_map:
+    #     orig_model = orig_model.to(device)
+    # compute_validation_perplexities(args, orig_model, eval_datasets)
+    # generate_overfit(orig_model, tokenizer, "FP32")
+
+    quant_model = load_nncf_quantized_model(args.nncf_ckpt_dir, orig_model, tokenizer)
+    # generate_overfit(quant_model, tokenizer, "FQ")
+    # compute_validation_perplexities(args, quant_model, eval_datasets)
+    # if not args.device_map:
+    #     device = "cuda"
+    #     quant_model = quant_model.to(device)
 
     print("Model loaded sucсessfully ...")
-
-    return model
+    return quant_model
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(add_help=True)
@@ -552,21 +562,7 @@ if __name__ == "__main__":
     # if device == 'cuda':
     #     model.half()
 
-    # # create original model
-    # orig_model = get_model(args.base_model, args.dtype, args.device_map, trust_remote_code=args.trust_remote_code)
-    # if not args.device_map:
-    #     orig_model = orig_model.to(device)
-    # # compute_validation_perplexities(args, orig_model, eval_datasets)
-    # # evaluate_model(orig_model, args)
-    # # exit()
-    # # generate_overfit(orig_model, tokenizer, "FP32")
-
-    # quant_model = load_nncf_quantized_model(args.nncf_ckpt_dir, orig_model, tokenizer)
-    # # generate_overfit(quant_model, tokenizer, "FQ")
-    # # compute_validation_perplexities(args, quant_model, eval_datasets)
-    # # evaluate_model(quant_model, args)
-    # if not args.device_map:
-    #     quant_model = quant_model.to(device)
+    quant_model = get_model(args.base_model, args.dtype, args.device_map, trust_remote_code=args.trust_remote_code)
 
     ckpt_dir = Path(args.nncf_ckpt_dir) / args.exp_name
     ckpt_dir.mkdir(exist_ok=True, parents=True)

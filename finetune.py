@@ -154,7 +154,8 @@ def evaluate_perplexity(
 
     for sequence_index, input_ids in enumerate(tqdm(inps, desc="Evaluating perplexity")):
         input_ids = input_ids.to(device)
-        with torch.amp.autocast('cuda', enabled=amp_dtype is not None, dtype=amp_dtype or torch.float32):
+        # TODO: hack amp_dtype or torch.float32):
+        with torch.amp.autocast('cuda', enabled=amp_dtype is not None, dtype=torch.bfloat16):
             lm_logits = model(input_ids).logits
 
         if sequence_index < num_sequences_without_padding:
@@ -419,26 +420,6 @@ def save_checkpoint(wrapped_model, ckpt_dir):
         },
         ckpt_dir / "nncf_checkpoint.pth",
     )
-
-# def evaluate_model(model_to_eval, args):
-#     """
-#     NOTE: NNCF doesn't work in layer-wise setup!
-#     Can infer via NNCFNetwork with enabled tracing on forward.
-#     """
-
-#     for dataset in args.eval_datasets:
-#         testloader = get_loaders(
-#             dataset,
-#             seed=args.seed,
-#             model_path=args.base_model,
-#             seqlen=args.eval_model_seqlen or args.model_seqlen,
-#             eval_mode=True,
-#             use_fast_tokenizer=args.use_fast_tokenizer,
-#             trust_remote_code=args.trust_remote_code,
-#         )
-#         args.dataset_name = dataset
-#         perplexity_eval(model_to_eval, testloader, args)
-#     torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(add_help=True)
@@ -715,7 +696,6 @@ if __name__ == "__main__":
     if not args.device_map:
         orig_model = orig_model.to(device)
     # compute_validation_perplexities(args, orig_model, eval_datasets)
-    # evaluate_model(orig_model, args)
     # exit()
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model, use_fast=args.use_fast_tokenizer, trust_remote_code=True
@@ -748,7 +728,7 @@ if __name__ == "__main__":
     quant_model = load_nncf_quantized_model(args.nncf_ckpt_dir, orig_model, tokenizer)
     # generate_overfit(quant_model, tokenizer, "FQ")
     # compute_validation_perplexities(args, quant_model, eval_datasets)
-    # evaluate_model(quant_model, args)
+    # exit()
     if not args.device_map:
         quant_model = quant_model.to(device)
 

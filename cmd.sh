@@ -45,11 +45,34 @@ set -e
 #     done
 # }
 
-tune_command_template='python finetune.py --base_model=microsoft/Phi-3-mini-4k-instruct --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_no_embed_svd_rank${rank}_g64/tune_fq_g64_rank256_lr0e+00_wd0e+00_n1024_fqlr1e-05_freq4_warm0/last_ckpt --model_seqlen=$model_seqlen --val_size=0   --adam_beta1=0.90  --adam_beta2=0.999  --early_stop=3 --batch_size=$batch_size  --microbatch_size=$microbatch_size --trust_remote_code  --keep_best_model --nsamples=$nsamples --dtype=float16 --weight_decay=$weight_decay --device_map=auto --amp --dataset=$dataset --lr=$lr --fq_lr=${fq_lr} --num_blocks=$num_blocks --frequency=$frequency --lr_scale=$lr_scale --warmup=$warmup --wandb'
-
-eval_command_template='lm_eval --model=hf --model_args=pretrained=microsoft/Phi-3-mini-4k-instruct,trust_remote_code=True,nncf_ckpt_dir=$nncf_ckpt_dir --tasks=wikitext'
-# overfit experiments
-# command_template='python finetune.py --base_model=microsoft/Phi-3-mini-4k-instruct --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_31layer_svd_debug --model_seqlen=$model_seqlen --val_size=0   --adam_beta1=0.90  --adam_beta2=0.999  --early_stop=3 --batch_size=$batch_size  --microbatch_size=$microbatch_size --trust_remote_code  --keep_best_model --nsamples=$nsamples --dtype=auto --weight_decay=$weight_decay --device_map=auto --amp --dataset=$dataset --lr=$lr --num_blocks=$num_blocks --frequency=$frequency --lr_scale=$lr_scale --epochs 5 --exp_name debug --print_every_steps=1'
+tune_command_template="python finetune.py \
+--base_model=microsoft/Phi-3-mini-4k-instruct \
+--nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_no_embed_svd_rank\${rank}_g64_bfloat16/ \
+--model_seqlen=\$model_seqlen \
+--val_size=0   \
+--adam_beta1=0.90  \
+--adam_beta2=0.999  \
+--early_stop=3 \
+--batch_size=\$batch_size \
+--microbatch_size=\$microbatch_size \
+--trust_remote_code  \
+--keep_best_model \
+--nsamples=\$nsamples \
+--dtype=bfloat16 \
+--load_dtype=bfloat16 \
+--finetune_dtype=bfloat16 \
+--amp_dtype=bfloat16 \
+--weight_decay=\$weight_decay \
+--device_map=auto \
+--dataset=\$dataset \
+--lr=\$lr \
+--fq_lr=\${fq_lr} \
+--num_blocks=\$num_blocks \
+--frequency=\$frequency \
+--lr_scale=\$lr_scale \
+--warmup=\$warmup"
+# --wandb
+# --amp
 
 weight_decays=1e-4 #(0 1e-5 1e-2)
 rank=256
@@ -58,11 +81,11 @@ batch_size=32
 microbatch_size=2 #2
 list_nsamples=1028 #128 #128
 dataset=wikitext2
-lrs=1e-5 #(5e-4 1e-4)
-fq_lrs=1e-6 #1e-3)
+lrs=1e-4 #(5e-4 1e-4)
+fq_lrs=1e-5 #1e-3)
 lr_scale=0 # 1 2)
-num_blockss=4 # 8)
-frequencys=2 #)
+num_blockss=32 # 8)
+frequencys=16 #)
 warmup=0
 
 for num_blocks in "${num_blockss[@]}"
@@ -89,6 +112,11 @@ do
         done
     done
 done
+
+# eval_command_template='lm_eval --model=hf --model_args=pretrained=microsoft/Phi-3-mini-4k-instruct,trust_remote_code=True,nncf_ckpt_dir=$nncf_ckpt_dir --tasks=wikitext'
+# overfit experiments
+# command_template='python finetune.py --base_model=microsoft/Phi-3-mini-4k-instruct --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_31layer_svd_debug --model_seqlen=$model_seqlen --val_size=0   --adam_beta1=0.90  --adam_beta2=0.999  --early_stop=3 --batch_size=$batch_size  --microbatch_size=$microbatch_size --trust_remote_code  --keep_best_model --nsamples=$nsamples --dtype=auto --weight_decay=$weight_decay --device_map=auto --amp --dataset=$dataset --lr=$lr --num_blocks=$num_blocks --frequency=$frequency --lr_scale=$lr_scale --epochs 5 --exp_name debug --print_every_steps=1'
+
 
 # seq_len 4096
 # python finetune.py  --base_model=microsoft/Phi-3-mini-4k-instruct  --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_31layer_svd/ --model_seqlen=4096 --val_size=0   --adam_beta1=0.90  --adam_beta2=0.999  --early_stop=3 --batch_size=4  --microbatch_size=2 --trust_remote_code  --keep_best_model --nsamples=128 --skip_first_eval --dtype=auto --device_map=auto --amp --dataset=wikitext2 --wandb --lr=1e-4 --epochs 5
