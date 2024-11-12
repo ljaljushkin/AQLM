@@ -199,7 +199,7 @@ def set_trainable(args, model, list_of_indexes: List[int]):
 
     param_to_train = [
         {"params": adapters_to_train,  "lr": args.lr, "weight_decay": args.weight_decay},
-        {"params": scales_to_train, "lr": args.fq_lr}
+        {"params": scales_to_train, "lr": args.fq_lr, "weight_decay": 0}#args.weight_decay}
     ]
     # diff_params = TODO: merge dicts
     return param_to_train
@@ -250,7 +250,7 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
     # opt = torch.optim.AdamW(param_to_train, lr=args.lr, betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.weight_decay)
     # scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
 
-    # num_training_steps = epoch_samples // args.batch_size
+
     # num_warmup_steps = num_training_steps // 3 if args.warmup else 0
     # lr_scheduler = transformers.get_cosine_schedule_with_warmup(
     #     opt, num_warmup_steps=num_warmup_steps, num_training_steps=num_epochs * num_training_steps, num_cycles=0.5
@@ -281,6 +281,7 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
             # metadata["scaled_lr"] = scaled_lr
             opt = torch.optim.AdamW(param_to_train, betas=(args.adam_beta1, args.adam_beta2))
             scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
+            lr_scheduler = transformers.get_constant_schedule_with_warmup(opt, num_warmup_steps=args.warmup)
 
         # train loop
         model.train()
@@ -305,6 +306,9 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
             # else:
             #     assert torch.equal(targets, cached_targets)
 
+            # TODO: tmp loss tuning
+            # with torch.autocast(device_type="cuda", enabled=args.amp):
+            #     loss = model(input_ids=inputs, labels=labels).loss
             with torch.autocast(device_type="cuda", enabled=args.amp):
                 outputs = model(inputs).logits
             loss = kl_div(outputs, targets.to(device=outputs.device, dtype=args.finetune_dtype))
@@ -324,7 +328,7 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
             scaler.scale(loss / grad_accumulation_steps).backward()
 
             if metadata["grad_steps_accumulated"] == grad_accumulation_steps:
-                # lr_scheduler.step()
+                lr_scheduler.step()
                 metadata["lr"] = get_lr(opt)
                 scaler.step(opt)
                 scaler.update()
@@ -379,17 +383,19 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
                 wandb.log(metadata, step=metadata["total_microbatches"])
 
         # TODO: why removed eval loss ??? maybe needed??? quick and on test data
+        # TODO: run lm_eval on wikitext??
         # NOTE: evaluate in the end of each epoch
-        perplexity_scores = compute_validation_perplexities(args, model, eval_datasets)
-        for dataset_name, perplexity in perplexity_scores.items():
-            metadata[f"perplexity_{dataset_name}"] = perplexity
-        metric_name = metadata["early_stop_on"]
-        if perplexity_scores[metric_name] < metadata["best_eval_perplexity"]:
-            print(f"New best perplexity ({metric_name}) = {perplexity_scores[metric_name]:.9f}")
-            metadata["best_eval_perplexity"] = perplexity_scores[args.eval_datasets[0]]
-            metadata["best_step"] = metadata["total_optimizer_steps"]
-            if args.keep_best_model:
-                save_checkpoint(model.model, ckpt_dir)
+        if (epoch + 1) % args.frequency == 0:
+            perplexity_scores = compute_validation_perplexities(args, model, eval_datasets)
+            for dataset_name, perplexity in perplexity_scores.items():
+                metadata[f"perplexity_{dataset_name}"] = perplexity
+            metric_name = metadata["early_stop_on"]
+            if perplexity_scores[metric_name] < metadata["best_eval_perplexity"]:
+                print(f"New best perplexity ({metric_name}) = {perplexity_scores[metric_name]:.9f}")
+                metadata["best_eval_perplexity"] = perplexity_scores[args.eval_datasets[0]]
+                metadata["best_step"] = metadata["total_optimizer_steps"]
+                if args.keep_best_model:
+                    save_checkpoint(model.model, ckpt_dir)
 
         metadata["microbatches_since_epoch_start"] = 0
         metadata["current_epoch"] += 1
@@ -449,7 +455,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--warmup",
-        action="store_true",
+        type=int,
     )
     parser.add_argument(
         "--weight_decay",
@@ -676,7 +682,7 @@ if __name__ == "__main__":
     # fq_lr_str = f"_fqlr{args.fq_lr}" if args.fq_lr else ''
     # exp_name = args.exp_name if args.exp_name else f"cosine{sched_suffix}_lr{args.lr:.0e}{fq_lr_str}"#_wd{args.weight_decay}"
     # rank = args.nncf_ckpt_dir.split('rank')[1]
-    exp_name =  f"tune_both_g64_rank8_lr{args.lr:.0e}_wd{args.weight_decay:.0e}_n{args.nsamples}_fqlr{args.fq_lr:.0e}_freq{args.frequency}"
+    exp_name =  f"tune_both_after_fq_g64_rank256_lr{args.lr:.0e}_wd{args.weight_decay:.0e}_n{args.nsamples}_fqlr{args.fq_lr:.0e}_freq{args.frequency}"
     # exp_name = args.exp_name
     if args.wandb:
         assert has_wandb, "`wandb` not installed, try pip install `wandb`"

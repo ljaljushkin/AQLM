@@ -15,18 +15,15 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "args": [
-                // "--nproc-per-node=1",
-                // "${file}",
-                // "--base_model=TinyLlama/TinyLlama_v1.1",
-                "--dtype=float16",
+                "--data_path=yahma/alpaca-cleaned",
+                "--epochs=1",
+                "--lr=1e-4",
+                "--batch_size=64",
+                "--microbatch_size=2",
+                "--wandb_project=trainer_tune",
+                //   "--dtype=float16",
                 "--base_model=microsoft/Phi-3-mini-4k-instruct",
-                // "--quant_model=ISTA-DASLab/Phi-3-mini-4k-instruct-AQLM-1x16",
-                // "--nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/TinyLlama_v1_1/FQ_4bit_emb32",
                 "--nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_31layer_svd",
-                "--dataset=pajama",
-                // "--dataset_name=wikitext",
-                // "--block_type=Phi3DecoderLayer",
-                "--nsamples=128", //128", // 1024
                 "--model_seqlen=1024", // TODO: CUDA OOM with 4096
                 "--val_size=0", // 128
                 "--lr=1e-4",
@@ -39,15 +36,49 @@
                 "--early_stop=3",
                 "--batch_size=4", //
                 "--microbatch_size=2",
-                "--exp_name=31layer_svd_n128_lr1e-4_fq_lr1e-3",
+                "--exp_name=31layer_svd_debug",
                 // "--gradient_checkpointing",
                 "--trust_remote_code",
                 // "--print_every_steps=1",
                 "--keep_best_model",
                 "--device_map=auto",
                 "--amp",
-                "--wandb",
-            ],
+                "--cache_dataset"
+            ]
+            // "args": [
+            //     // "--nproc-per-node=1",
+            //     // "${file}",
+            //     // "--base_model=TinyLlama/TinyLlama_v1.1",
+            //     "--dtype=float16",
+            //     "--base_model=microsoft/Phi-3-mini-4k-instruct",
+            //     // "--quant_model=ISTA-DASLab/Phi-3-mini-4k-instruct-AQLM-1x16",
+            //     // "--nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/TinyLlama_v1_1/FQ_4bit_emb32",
+            //     "--nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_31layer_svd",
+            //     "--dataset=pajama",
+            //     // "--dataset_name=wikitext",
+            //     // "--block_type=Phi3DecoderLayer",
+            //     "--nsamples=128", //128", // 1024
+            //     "--model_seqlen=1024", // TODO: CUDA OOM with 4096
+            //     "--val_size=0", // 128
+            //     "--lr=1e-4",
+            //     "--lr_scale=0",
+            //     "--weight_decay=0",
+            //     "--adam_beta1=0.90",
+            //     "--adam_beta2=0.999",
+            //     // "--max_epochs=1",//
+            //     "--epochs=20",
+            //     "--early_stop=3",
+            //     "--batch_size=4", //
+            //     "--microbatch_size=2",
+            //     "--exp_name=31layer_svd_n128_lr1e-4_fq_lr1e-3",
+            //     // "--gradient_checkpointing",
+            //     "--trust_remote_code",
+            //     // "--print_every_steps=1",
+            //     "--keep_best_model",
+            //     "--device_map=auto",
+            //     "--amp",
+            //     "--wandb",
+            // ],
             // FULL CMD:
             // torchrun \
             // finetune.py \
