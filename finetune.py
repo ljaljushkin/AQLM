@@ -181,11 +181,11 @@ def set_trainable(args, model, list_of_indexes: List[int]):
     for name, param in model.named_parameters():
         for index in list_of_indexes:
             # if f"layers_{index}_" in name and word_to_find in name:
-            if f"layers_{index}_" in name and "lora" in name:
-                param.requires_grad = True
-                adapters_to_train.append(param)
-                break
-            if f"layers_{index}_" in name and "input" in name:
+            # if f"layers_{index}_" in name and "down_proj_weight._lora_A" in name:
+            #     param.requires_grad = True
+            #     adapters_to_train.append(param)
+            #     break
+            if f"layers_{index}_" in name and "down_proj_weight.input_low" in name:
                 param.requires_grad = True
                 scales_to_train.append(param)
                 break
@@ -199,7 +199,7 @@ def set_trainable(args, model, list_of_indexes: List[int]):
     print_trainable_parameters(model)
 
     param_to_train = [
-        {"params": adapters_to_train,  "lr": args.lr, "weight_decay": args.weight_decay},
+        # {"params": adapters_to_train,  "lr": args.lr, "weight_decay": args.weight_decay},
         {"params": scales_to_train, "lr": args.fq_lr, "weight_decay": 0}#args.weight_decay}
     ]
     # diff_params = TODO: merge dicts
@@ -245,12 +245,11 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
     num_switches = NUM_LAYERS // args.num_blocks
     num_epochs = num_switches * args.frequency
     # num_epochs = args.epochs
-
+    num_training_steps = epoch_samples // args.batch_size
     # is_lora = True
     # param_to_train = set_trainable(model, list_of_indexes=[31], is_lora=is_lora) # diff_params
     # opt = torch.optim.AdamW(param_to_train, lr=args.lr, betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.weight_decay)
     # scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
-
 
     # num_warmup_steps = num_training_steps // 3 if args.warmup else 0
     # lr_scheduler = transformers.get_cosine_schedule_with_warmup(
@@ -269,7 +268,7 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
             i_switch = epoch // args.frequency
             metadata["num_tuned_blocks"] = i_switch * args.num_blocks
             active_layers_ids = list(range(i_switch * args.num_blocks, (i_switch + 1) * args.num_blocks))
-            # active_layers_ids = list(range(31,32))
+            active_layers_ids = list(range(23,24))
             param_to_train = set_trainable(args, model, active_layers_ids)
             if not param_to_train:
                 print('All layers are tuned!')
@@ -281,8 +280,15 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
             # scaled_lr = scaled_lr if is_lora else scaled_lr / 50
             # metadata["scaled_lr"] = scaled_lr
             opt = torch.optim.AdamW(param_to_train, betas=(args.adam_beta1, args.adam_beta2))
-            scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
+            # scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
             lr_scheduler = transformers.get_constant_schedule_with_warmup(opt, num_warmup_steps=args.warmup)
+            # lr_scheduler = transformers.get_cosine_schedule_with_warmup(
+            #     opt,
+            #     num_warmup_steps=args.warmup,
+            #     num_training_steps=num_epochs * num_training_steps,
+            #     num_cycles=0.5
+            # )
+            # wandb.watch(model.model, log='gradients')
 
         # train loop
         model.train()
@@ -310,8 +316,8 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
             # TODO: tmp loss tuning
             # with torch.autocast(device_type="cuda", enabled=args.amp):
             #     loss = model(input_ids=inputs, labels=labels).loss
-            with torch.autocast(device_type="cuda", enabled=args.amp):
-                outputs = model(inputs).logits
+            # with torch.autocast(device_type="cuda", enabled=args.amp):
+            outputs = model(inputs).logits
             loss = kl_div(outputs, targets.to(device=outputs.device, dtype=args.finetune_dtype))
 
             metadata["loss_numerator"] += loss.item()
@@ -321,18 +327,31 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
             if not torch.isfinite(loss).item():
                 raise ValueError(f"Fine-tuning loss is {loss}")
 
-            # A_before = quant_model.model._nncf.external_quantizers.FQ_LORA_for_node_layers_31_mlp_gate_up_proj_weight._lora_A.data.clone()
+            A_before = quant_model.model._nncf.external_quantizers.FQ_LORA_for_node_layers_23_mlp_down_proj_weight._lora_A.data.clone()
             # B_before = quant_model.model._nncf.external_quantizers.FQ_LORA_for_node_layers_31_mlp_gate_up_proj_weight._lora_B.data.clone()
-            # IL_before = quant_model.model._nncf.external_quantizers.FQ_LORA_for_node_layers_31_mlp_gate_up_proj_weight.input_low.data.clone()
+            IL_before = quant_model.model._nncf.external_quantizers.FQ_LORA_for_node_layers_23_mlp_down_proj_weight.input_low.data.clone()
             # W_before = quant_model.model.layers[31].mlp.gate_up_proj.weight.data.clone()
 
-            scaler.scale(loss / grad_accumulation_steps).backward()
+            # scaler.scale(loss / grad_accumulation_steps).backward()
+            (loss / grad_accumulation_steps).backward()
+
+            # Compute gradient magnitudes
+            # grad_magnitudes = []
+            # for param in model.parameters():
+            #     if param.grad is not None:
+            #         grad_magnitudes.append(param.grad.norm().item())
+            # print(grad_magnitudes)
+            # Log gradient magnitudes to wandb
+            # metadata["grad_magnitude"] = grad_magnitudes
 
             if metadata["grad_steps_accumulated"] == grad_accumulation_steps:
+                # print('step')
+                # print(quant_model.model._nncf.external_quantizers.FQ_LORA_for_node_layers_31_mlp_gate_up_proj_weight.input_low.grad)
                 lr_scheduler.step()
                 metadata["lr"] = get_lr(opt)
-                scaler.step(opt)
-                scaler.update()
+                opt.step()
+                # scaler.step(opt)
+                # scaler.update()
                 opt.zero_grad()
                 # reset accumulated step and loss
                 metadata["grad_steps_accumulated"] = 0
@@ -342,18 +361,23 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
 
             # NOTE: debug that some parameters updated and some - frozen
             # A_after = quant_model.model._nncf.external_quantizers.FQ_LORA_for_node_layers_31_mlp_gate_up_proj_weight._lora_A.data
+            A_after = quant_model.model._nncf.external_quantizers.FQ_LORA_for_node_layers_23_mlp_down_proj_weight._lora_A.data
             # B_after = quant_model.model._nncf.external_quantizers.FQ_LORA_for_node_layers_31_mlp_gate_up_proj_weight._lora_B.data
-            # IL_after = quant_model.model._nncf.external_quantizers.FQ_LORA_for_node_layers_31_mlp_gate_up_proj_weight.input_low.data
+            IL_after = quant_model.model._nncf.external_quantizers.FQ_LORA_for_node_layers_23_mlp_down_proj_weight.input_low.data
             # W_after = quant_model.model.layers[31].mlp.gate_up_proj.weight.data
             # if not is_lora: # NOTE: because of switch the opposite condition!
             #     if epoch != 0: # NOTE: if B initialized by zeros, gradient for A is B * gradient_output = 0
-            #         assert not torch.equal(A_before, A_after) # TODO: can happen with big lr and with AMP. grad protect??
+            #
             #     assert not torch.equal(B_before, B_after)
             #     assert not torch.equal(IL_before, IL_after)
             # else:
-            #     assert torch.equal(A_before, A_after)
+
             #     assert torch.equal(B_before, B_after)
-            #     assert not torch.equal(IL_before, IL_after)
+            # if epoch != 0:
+            # assert not torch.equal(A_before, A_after)
+            assert not torch.equal(IL_before, IL_after)
+            # assert torch.equal(A_before, A_after)
+            # assert torch.equal(B_before, B_after)
             # assert torch.equal(W_after, W_after)
 
             if args.print_every_steps and metadata["total_optimizer_steps"] % args.print_every_steps == 0 and metadata["grad_steps_accumulated"] == 0:
@@ -386,22 +410,23 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
         # TODO: why removed eval loss ??? maybe needed??? quick and on test data
         # TODO: run lm_eval on wikitext??
         # NOTE: evaluate in the end of each epoch
-        if (epoch + 1) % args.frequency == 0:
-            perplexity_scores = compute_validation_perplexities(args, model, eval_datasets)
-            for dataset_name, perplexity in perplexity_scores.items():
-                metadata[f"perplexity_{dataset_name}"] = perplexity
-            metric_name = metadata["early_stop_on"]
-            if perplexity_scores[metric_name] < metadata["best_eval_perplexity"]:
-                print(f"New best perplexity ({metric_name}) = {perplexity_scores[metric_name]:.9f}")
-                metadata["best_eval_perplexity"] = perplexity_scores[args.eval_datasets[0]]
-                metadata["best_step"] = metadata["total_optimizer_steps"]
-                if args.keep_best_model:
-                    save_checkpoint(model.model, ckpt_dir)
+        # if (epoch + 1) % args.frequency == 0:
+        # TODO: eval similarity!? with chat template
+        # perplexity_scores = compute_validation_perplexities(args, model, eval_datasets)
+        # for dataset_name, perplexity in perplexity_scores.items():
+        #     metadata[f"perplexity_{dataset_name}"] = perplexity
+        # metric_name = metadata["early_stop_on"]
+        # if perplexity_scores[metric_name] < metadata["best_eval_perplexity"]:
+        #     print(f"New best perplexity ({metric_name}) = {perplexity_scores[metric_name]:.9f}")
+        #     metadata["best_eval_perplexity"] = perplexity_scores[args.eval_datasets[0]]
+        #     metadata["best_step"] = metadata["total_optimizer_steps"]
+        #     if args.keep_best_model:
+        #         save_checkpoint(model.model, ckpt_dir)
 
         metadata["microbatches_since_epoch_start"] = 0
         metadata["current_epoch"] += 1
 
-    print("last loss=", loss)
+    # print("last loss=", loss)
 
 
 def print_memory_stats():
@@ -663,7 +688,8 @@ if __name__ == "__main__":
     # fq_lr_str = f"_fqlr{args.fq_lr}" if args.fq_lr else ''
     # exp_name = args.exp_name if args.exp_name else f"cosine{sched_suffix}_lr{args.lr:.0e}{fq_lr_str}"#_wd{args.weight_decay}"
     # rank = args.nncf_ckpt_dir.split('rank')[1]
-    exp_name =  f"tune_both_after_fq_g64_rank256_lr{args.lr:.0e}_wd{args.weight_decay:.0e}_n{args.nsamples}_fqlr{args.fq_lr:.0e}_freq{args.frequency}"
+    exp_name =  args.exp_name if args.exp_name else f"slm_const_g64_rank256_lr{args.lr:.0e}_n{args.nsamples}_fqlr{args.fq_lr:.0e}_wd{args.weight_decay:.0e}_bs{args.batch_size}_rand"
+    # exp_name = 'debug'
     # exp_name = args.exp_name
     if args.wandb:
         assert has_wandb, "`wandb` not installed, try pip install `wandb`"
@@ -703,13 +729,14 @@ if __name__ == "__main__":
     # generate_overfit(orig_model, tokenizer, "FP32")
 
     # NOTE: overfit experiments
-    # train_dataloader = [tokenizer("overfit " * 10, return_tensors="pt")["input_ids"]]
+    train_dataloader = [tokenizer("b", return_tensors="pt")["input_ids"]]
 
     # cache logits
     start = time.time()
     CACHE_DIR = MODEL_DIR / 'hiddens_cache'
     CACHE_DIR.mkdir(exist_ok=True, parents=True)
-    TRAIN_HIDDENS_PATH = CACHE_DIR / Path(f'{model_name}_train_hiddens_n{args.nsamples}_data_{args.dataset}.pth')
+    # TRAIN_HIDDENS_PATH = CACHE_DIR / Path(f'{model_name}_train_hiddens_n{args.nsamples}_data_{args.dataset}.pth')
+    TRAIN_HIDDENS_PATH = CACHE_DIR / Path('blabla.pth')
     if TRAIN_HIDDENS_PATH.exists():
         orig_train_hiddens = torch.load(TRAIN_HIDDENS_PATH)
     else:
@@ -747,12 +774,12 @@ if __name__ == "__main__":
         eval_datasets=eval_datasets
     )
 
-    generate_overfit(quant_model, tokenizer, "after tune")
+    # generate_overfit(quant_model, tokenizer, "after tune")
 
     # compute_validation_perplexities(args, quant_model, eval_datasets)
-    last_dir = ckpt_dir / "last_ckpt"
-    last_dir.mkdir(exist_ok=True, parents=True)
-    save_checkpoint(quant_model.model, last_dir)
+    # last_dir = ckpt_dir / "last_ckpt"
+    # last_dir.mkdir(exist_ok=True, parents=True)
+    # save_checkpoint(quant_model.model, last_dir)
 
     print_memory_stats()
 
