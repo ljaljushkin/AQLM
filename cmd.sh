@@ -49,7 +49,7 @@ set -e
 # _svd_rank\${rank}_g64_float32
 tune_command_template="python finetune.py \
 --base_model=HuggingFaceTB/SmolLM-1.7B-Instruct \
---nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/SmolLM-1_7B-Instruct/FQ_4bit_no_embed_svd_rank\${rank}_g64_bfloat16_rand_quant100+/ \
+--nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/SmolLM-1_7B-Instruct/FQ_4bit_no_embed_svd_rank\${rank}_g64_hybrid_rand_quant100+/ \
 --model_seqlen=\$model_seqlen \
 --val_size=0   \
 --adam_beta1=0.90  \
@@ -60,8 +60,6 @@ tune_command_template="python finetune.py \
 --trust_remote_code  \
 --keep_best_model \
 --nsamples=\$nsamples \
---load_dtype=bfloat16 \
---amp_dtype=bfloat16 \
 --weight_decay=\$weight_decay \
 --dataset=\$dataset \
 --lr=\$lr \
@@ -84,7 +82,7 @@ tune_command_template="python finetune.py \
 # "--wandb_project=trainer_tune"
 # DISTILLATION
 
-weight_decays=0 #2e-4 1e-2) #(0 1e-5 1e-2)
+weight_decays=1e-4 #2e-4 1e-2) #(0 1e-5 1e-2)
 rank=256
 model_seqlen=1024
 batch_sizes=32 #(128 64) #32

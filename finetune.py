@@ -157,9 +157,9 @@ def cache_hiddens(model, dataloader):
     device = next(model.parameters()).device
     cached_hiddens = []
     for i in trange(len(dataloader), total=len(dataloader), desc="Caching hiddens", leave=False):
-        with torch.autocast(device_type="cuda", enabled=args.amp):
-            batch = maybe_get_0th_element(dataloader[i]).to(device)
-            cached_hiddens.append(model.model(batch).last_hidden_state.cpu())
+        # with torch.autocast(device_type="cuda", enabled=args.amp):
+        batch = maybe_get_0th_element(dataloader[i]).to(device)
+        cached_hiddens.append(model.model(batch).last_hidden_state.cpu())
     return cached_hiddens
 
 
@@ -218,8 +218,8 @@ def evaluate_perplexity(
     for sequence_index, input_ids in enumerate(tqdm(inps, desc="Evaluating perplexity")):
         input_ids = input_ids.to(device)
         # TODO: hack amp_dtype or torch.float32):
-        with torch.amp.autocast('cuda', enabled=amp_dtype is not None, dtype=torch.bfloat16):
-            lm_logits = model(input_ids).logits
+        # with torch.amp.autocast('cuda', enabled=amp_dtype is not None, dtype=torch.bfloat16):
+        lm_logits = model(input_ids).logits
 
         if sequence_index < num_sequences_without_padding:
             shift_logits = lm_logits[:, :-1, :].contiguous()
@@ -277,7 +277,8 @@ def get_lr(optimizer):
 
 def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, eval_datasets=None, Xmap=None):
     # cast model to finetune dtype
-    model.to(args.finetune_dtype)
+    # TODO: just load with dtype=bfloat16 and keep FQ params in float32, otherwise they are not trained.
+    # model.to(args.finetune_dtype)
     # NOTE: copy is needed for calculating target outputs
     lm_head = deepcopy(model.lm_head)
     for param in lm_head.parameters():
@@ -516,8 +517,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--load_dtype",
         type=str,
-        default="auto",
-        choices=["auto", "float16", "float32", "bfloat16"],
+        default=None,
+        # default="auto",
+        # choices=["auto", "float16", "float32", "bfloat16"],
         help="dtype to load the model in",
     )
     # parser.add_argument(
