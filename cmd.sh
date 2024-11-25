@@ -60,8 +60,8 @@ tune_command_template="python finetune.py \
 --trust_remote_code  \
 --keep_best_model \
 --nsamples=\$nsamples \
---load_dtype=float32 \
---amp_dtype=float32 \
+--load_dtype=bfloat16 \
+--amp_dtype=bfloat16 \
 --weight_decay=\$weight_decay \
 --dataset=\$dataset \
 --lr=\$lr \
@@ -71,8 +71,8 @@ tune_command_template="python finetune.py \
 --lr_scale=\$lr_scale \
 --warmup=\$warmup \
 --device_map=auto \
---dtype=float32 \
---finetune_dtype=float32 \
+--dtype=bfloat16 \
+--finetune_dtype=bfloat16 \
 --wandb"
 
 # --print_every_steps=1"
