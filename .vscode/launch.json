@@ -17,7 +17,7 @@
             "cwd": "${workspaceFolder}",
             "args": [
                 "--base_model=HuggingFaceTB/SmolLM-1.7B-Instruct",
-                "--nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/SmolLM-1_7B-Instruct/FQ_4bit_no_embed_svd_rank256_g64_bfloat16_rand_quant/",
+                "--nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/SmolLM-1_7B-Instruct/FQ_4bit_no_embed_svd_rank256_g64_bfloat16_rand_quant100+/",
                 "--model_seqlen=1024",
                 "--val_size=0",
                 "--adam_beta1=0.90",
