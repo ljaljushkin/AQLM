@@ -1,32 +1,5 @@
 #!/bin/bash
 
-# python finetune.py  --base_model=microsoft/Phi-3-mini-4k-instruct  --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_no_embed_svd/  --dataset=pajama  --model_seqlen=1024 --val_size=0   --adam_beta1=0.90  --adam_beta2=0.999  --early_stop=3 --batch_size=4  --microbatch_size=2 --trust_remote_code  --eval_every_steps=64  --keep_best_model --nsamples=128 --lr=5e-4 --skip_first_eval --dtype=auto --device_map=auto --amp --wandb --num_blocks=4 --frequency=6
-# python finetune.py  --base_model=microsoft/Phi-3-mini-4k-instruct  --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_no_embed_svd/  --dataset=pajama  --model_seqlen=1024 --val_size=0   --adam_beta1=0.90  --adam_beta2=0.999  --early_stop=3 --batch_size=4  --microbatch_size=2 --trust_remote_code  --eval_every_steps=64  --keep_best_model --nsamples=128 --lr=5e-4 --skip_first_eval --dtype=auto --device_map=auto --amp --wandb --num_blocks=4 --frequency=2
-# python finetune.py  --base_model=microsoft/Phi-3-mini-4k-instruct  --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_no_embed_svd/  --dataset=pajama  --model_seqlen=1024 --val_size=0   --adam_beta1=0.90  --adam_beta2=0.999  --early_stop=3 --batch_size=4  --microbatch_size=2 --trust_remote_code  --eval_every_steps=64  --keep_best_model --nsamples=128 --lr=5e-4 --skip_first_eval --dtype=auto --device_map=auto --amp --wandb --num_blocks=2 --frequency=2
-# python finetune.py  --base_model=microsoft/Phi-3-mini-4k-instruct  --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_no_embed_svd/  --dataset=pajama  --model_seqlen=1024 --val_size=0   --adam_beta1=0.90  --adam_beta2=0.999  --early_stop=3 --batch_size=4  --microbatch_size=2 --trust_remote_code  --eval_every_steps=64  --keep_best_model --nsamples=128 --lr=1e-4 --skip_first_eval --dtype=auto --device_map=auto --amp --wandb --num_blocks=2 --frequency=2
-# python finetune.py  --base_model=microsoft/Phi-3-mini-4k-instruct  --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_no_embed_svd/  --dataset=pajama  --model_seqlen=1024 --val_size=0   --adam_beta1=0.90  --adam_beta2=0.999  --early_stop=3 --batch_size=4  --microbatch_size=2 --trust_remote_code  --eval_every_steps=64  --keep_best_model --nsamples=128 --lr=5e-4 --skip_first_eval --dtype=auto --device_map=auto --amp --wandb --num_blocks=8 --frequency=8
-# set -e
-# python finetune.py  --base_model=microsoft/Phi-3-mini-4k-instruct  --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_no_embed_svd/  --dataset=pajama  --model_seqlen=1024 --val_size=0   --adam_beta1=0.90  --adam_beta2=0.999  --early_stop=3 --batch_size=4  --microbatch_size=2 --trust_remote_code  --eval_every_steps=64  --keep_best_model --nsamples=128 --lr=5e-4 --skip_first_eval --dtype=auto --device_map=auto --amp --wandb --num_blocks=4 --frequency=2 --lr_scale=10
-# python finetune.py  --base_model=microsoft/Phi-3-mini-4k-instruct  --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_no_embed_svd/  --dataset=pajama  --model_seqlen=1024 --val_size=0   --adam_beta1=0.90  --adam_beta2=0.999  --early_stop=3 --batch_size=4  --microbatch_size=2 --trust_remote_code  --eval_every_steps=64  --keep_best_model --nsamples=128 --lr=5e-4 --skip_first_eval --dtype=auto --device_map=auto --amp --wandb --num_blocks=4 --frequency=2 --lr_scale=5
-# python finetune.py  --base_model=microsoft/Phi-3-mini-4k-instruct  --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_no_embed_svd/  --dataset=pajama  --model_seqlen=1024 --val_size=0   --adam_beta1=0.90  --adam_beta2=0.999  --early_stop=3 --batch_size=4  --microbatch_size=2 --trust_remote_code  --eval_every_steps=64  --keep_best_model --nsamples=128 --lr=5e-4 --skip_first_eval --dtype=auto --device_map=auto --amp --wandb --num_blocks=8 --frequency=1 --lr_scale=1
-
-# not finished
-# python finetune.py  --base_model=microsoft/Phi-3-mini-4k-instruct  --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_no_embed_svd/  --dataset=pajama  --model_seqlen=1024 --val_size=0   --adam_beta1=0.90  --adam_beta2=0.999  --early_stop=3 --batch_size=4  --microbatch_size=2 --trust_remote_code  --eval_every_steps=64  --keep_best_model --nsamples=128 --lr=5e-4 --skip_first_eval --dtype=auto --device_map=auto --amp --wandb --num_blocks=8 --frequency=1 --lr_scale=5
-# python finetune.py  --base_model=microsoft/Phi-3-mini-4k-instruct  --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_no_embed_svd/  --dataset=pajama  --model_seqlen=1024 --val_size=0   --adam_beta1=0.90  --adam_beta2=0.999  --early_stop=3 --batch_size=4  --microbatch_size=2 --trust_remote_code  --eval_every_steps=64  --keep_best_model --nsamples=128 --lr=5e-4 --skip_first_eval --dtype=auto --device_map=auto --amp --wandb --num_blocks=8 --frequency=8 --lr_scale=5
-
-# 31 layer
-# python finetune.py  --base_model=microsoft/Phi-3-mini-4k-instruct  --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_31layer_svd/ --model_seqlen=1024 --val_size=0   --adam_beta1=0.90  --adam_beta2=0.999  --early_stop=3 --batch_size=4  --microbatch_size=2 --trust_remote_code  --keep_best_model --nsamples=128 --skip_first_eval --dtype=auto --device_map=auto --amp --dataset=wikitext2 --wandb --lr=1e-4 --epochs 5
-# --weight_decay=1e-5
-
-# cosine lr=3e-4
-# python finetune.py  --base_model=microsoft/Phi-3-mini-4k-instruct  --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_31layer_svd/ --model_seqlen=1024 --val_size=0   --adam_beta1=0.90  --adam_beta2=0.999  --early_stop=3 --batch_size=4  --microbatch_size=2 --trust_remote_code  --keep_best_model --nsamples=128 --skip_first_eval --dtype=auto --device_map=auto --amp --dataset=wikitext2 --wandb --lr=3e-4 --epochs 5
-
-# cosine lr=3e-4 warmup for 1/3 epoch
-# python finetune.py  --base_model=microsoft/Phi-3-mini-4k-instruct  --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_31layer_svd/ --model_seqlen=1024 --val_size=0   --adam_beta1=0.90  --adam_beta2=0.999  --early_stop=3 --batch_size=4  --microbatch_size=2 --trust_remote_code  --keep_best_model --nsamples=128 --skip_first_eval --dtype=auto --device_map=auto --amp --dataset=wikitext2 --wandb --lr=3e-4 --epochs 5 --warmup
-
-# const lr=1e-4, FQ lr=1e-5
-# const lr=1e-5, FQ lr=1e-4
-
 set -e
 
 # run_commands() {
@@ -45,11 +18,12 @@ set -e
 #     done
 # }
 
+# --base_model=microsoft/Phi-3-mini-4k-instruct \
+# --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_no_embed_svd_rank\${rank}_g64_hybrid_rand_quant100+/ \
 # --base_model=microsoft/Phi-3.5-mini-instruct \
-# _svd_rank\${rank}_g64_float32
 tune_command_template="python finetune.py \
 --base_model=HuggingFaceTB/SmolLM-1.7B-Instruct \
---nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/SmolLM-1_7B-Instruct/FQ_4bit_no_embed_svd_rank\${rank}_g64_hybrid_rand_quant100+/ \
+--nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/SmolLM-1_7B-Instruct/FQ_4bit_no_embed_svd_rank\${rank}_g64_hybrid_rand_quant100+_sqrtS/ \
 --model_seqlen=\$model_seqlen \
 --val_size=0   \
 --adam_beta1=0.90  \
@@ -59,6 +33,7 @@ tune_command_template="python finetune.py \
 --microbatch_size=\$microbatch_size \
 --trust_remote_code  \
 --keep_best_model \
+--device_map=auto \
 --nsamples=\$nsamples \
 --weight_decay=\$weight_decay \
 --dataset=\$dataset \
@@ -68,11 +43,12 @@ tune_command_template="python finetune.py \
 --frequency=\$frequency \
 --lr_scale=\$lr_scale \
 --warmup=\$warmup \
---device_map=auto \
 --dtype=bfloat16 \
 --finetune_dtype=bfloat16 \
---wandb"
+--qloss \
+--mlflow"
 
+# --exp_name=slm_const_lr2e-04_fqlr1e-03_wd1e-03_rand100+_qloss_n1024_r1"
 # --print_every_steps=1"
 # --print_every_steps=1 \
 # --exp_name=debug \
@@ -87,13 +63,13 @@ rank=256
 model_seqlen=1024
 batch_sizes=32 #(128 64) #32
 microbatch_size=2 #2 #2
-list_nsamples=1024 #1024 #128 #128
+list_nsamples=1024 #128 #128
 dataset=wikitext2
 lrs=1e-4
 fq_lrs=1e-3
 lr_scale=0 # 1 2)
 num_blocks=32 # 8)
-frequencys=16 #2 #(8 16 32)
+frequencys=32 #2 #(8 16 32)
 warmup=0 #(6 16 32)
 
 for batch_size in "${batch_sizes[@]}"

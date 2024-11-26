@@ -1,5 +1,9 @@
+import sys
+import json
+import ast
 from typing import Dict, Optional, Tuple, List
 import argparse
+import subprocess
 import os
 import shutil
 from copy import deepcopy
@@ -13,12 +17,9 @@ from nncf.torch.dynamic_graph.context import forward_nncf_trace
 import transformers
 import numpy as np
 from collections import defaultdict
-try:
-    import wandb
-
-    has_wandb = True
-except ModuleNotFoundError:
-    has_wandb = False
+# import wandb
+import mlflow
+from collections import OrderedDict
 
 from main import perplexity_eval
 from src.datautils import get_loaders
@@ -28,7 +29,7 @@ from transformers import (
     AutoTokenizer
 )
 from pathlib import Path
-from whowhatbench import Evaluator
+from whowhatbench import TextEvaluator
 import random
 import torch.nn as nn
 
@@ -60,14 +61,24 @@ def get_quant_noise(quant_model, Xmap):
         X = Xmap[layer]
         W = layer.weight
         FQ_W = quantizer.quantize(W)
-        diff = X @ W.t() - X @ FQ_W.t()
+        diff = X @ (W - FQ_W).t()
         loss_ = torch.linalg.norm(diff, ord="fro").item()
-        # print('layer={} loss={:.1f}'.format(name, loss_))
         loss += loss_
     return loss
 
+def lm_eval(args, ckpt_dir):
+    result_path = ckpt_dir / "results.json"
+    cmd = f"lm_eval --model=hf --model_args=pretrained={args.base_model},trust_remote_code=True,nncf_ckpt_dir={ckpt_dir},device_map=auto,parallelize=True,dtype=bfloat16 --tasks=wikitext --output_path={result_path}"
+    sys.stdout.flush()
+    subprocess.run(cmd.split(' '))
+    with result_path.open('r') as f:
+        print('Parsing lm-eval results from file: ', result_path)
+        j = json.load(f)
+        return j["results"]["wikitext"]["word_perplexity,none"]
+
+@torch.no_grad()
 def get_Xmap(model_, calib_dataloader):
-    mean_values_list_per_module = register_hooks(model_)
+    mean_values_list_per_module, handles = register_hooks(model_)
     for i in trange(len(calib_dataloader), total=len(calib_dataloader), desc="Collecting activations", leave=False):
         batch = maybe_get_0th_element(calib_dataloader[i]).to(device)
         model_.model(batch)
@@ -77,6 +88,8 @@ def get_Xmap(model_, calib_dataloader):
         return (key, torch.stack(value).squeeze())
 
     mean_values_list_per_module = dict(map(stack_values, mean_values_list_per_module.items()))
+    for handle in handles:
+        handle.remove()
     return mean_values_list_per_module
 
 def load_nncf_quantized_model(nncf_ckpt_dir, student_model, tokenizer):
@@ -145,10 +158,8 @@ def register_hooks(model):
             mean_across_tokens = torch.mean(input_[0], dim=(reduction_axes,), keepdim=True)
             mean_values_list_per_module[module].append(mean_across_tokens)
 
-    for layer in model.modules():
-        layer.register_forward_hook(hook_fn)
-
-    return mean_values_list_per_module
+    handles = [layer.register_forward_hook(hook_fn) for layer in model.modules()]
+    return mean_values_list_per_module, handles
 
 
 
@@ -275,12 +286,12 @@ def get_lr(optimizer):
         return param_group['lr']
 
 
-def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, eval_datasets=None, Xmap=None):
+def finetune(model_to_tune, train_loader, train_hiddens, args, device, ckpt_dir=None, eval_datasets=None, Xmap=None, wwb_eval=None):
     # cast model to finetune dtype
     # TODO: just load with dtype=bfloat16 and keep FQ params in float32, otherwise they are not trained.
-    # model.to(args.finetune_dtype)
+    # model_to_tune.to(args.finetune_dtype)
     # NOTE: copy is needed for calculating target outputs
-    lm_head = deepcopy(model.lm_head)
+    lm_head = deepcopy(model_to_tune.lm_head)
     for param in lm_head.parameters():
         param.requires_grad = False
 
@@ -290,25 +301,28 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
     microbatches_per_epoch = epoch_samples // args.microbatch_size
 
     if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
-        model.enable_input_require_grads()
+        model_to_tune.gradient_checkpointing_enable()
+        model_to_tune.enable_input_require_grads()
 
-    metadata = dict(
-        current_epoch=0,
-        microbatches_since_epoch_start=0,
-        total_microbatches=0,
-        total_optimizer_steps=0,
-        kl_loss_numerator=0,
-        q_loss_numerator=0,
-        loss_denominator=0,
-        aggregated_loss=float("nan"),
-        aggregated_kl_loss=float("nan"),
-        aggregated_q_loss=float("nan"),
-        grad_steps_accumulated=0,
-        early_stop_on=next(iter(args.eval_datasets)) if args.eval_datasets else None,
-        best_eval_perplexity=float("inf"),
-        best_step=0,
-    )
+    metadata = OrderedDict([
+        ('lm_eval_word_ppl', float("inf")),
+        ('perplexity_wikitext2', float("inf")),
+        ('aggregated_loss', float("nan")),
+        ('aggregated_kl_loss', float("nan")),
+        ('aggregated_q_loss', float("nan")),
+        ('current_epoch', 0),
+
+        ('microbatches_since_epoch_start', 0),
+        ('total_microbatches', 0),
+        ('total_optimizer_steps', 0),
+        ('kl_loss_numerator', 0),
+        ('q_loss_numerator', 0),
+        ('loss_denominator', 0),
+        ('grad_steps_accumulated', 0),
+        ('best_eval_perplexity', float("inf")),
+        ('best_step', 0),
+        ('early_stop_on', next(iter(args.eval_datasets)) if args.eval_datasets else None),
+    ])
     NUM_LAYERS = 32
     HIDDEN_DIM = 3072
     num_switches = NUM_LAYERS // args.num_blocks
@@ -316,18 +330,15 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
     # num_epochs = args.epochs
     num_training_steps = epoch_samples // args.batch_size
     cached_targets = None
-    layer = quant_model.model._nncf.external_quantizers.FQ_LORA_for_node_layers_23_mlp_down_proj_weight
-    first_loss = 0.07
-    first_qloss = 1322
-    ratio = 1/2
-    factor = first_qloss / first_loss
+    layer = model_to_tune.model._nncf.external_quantizers.FQ_LORA_for_node_layers_23_mlp_down_proj_weight
+    qloss_strength = 1/2
     for epoch in range(num_epochs):
         if epoch % args.frequency == 0:
             i_switch = epoch // args.frequency
             metadata["num_tuned_blocks"] = i_switch * args.num_blocks
             active_layers_ids = list(range(i_switch * args.num_blocks, (i_switch + 1) * args.num_blocks))
             # active_layers_ids = list(range(23,24))
-            param_to_train = set_trainable(args, model, active_layers_ids)
+            param_to_train = set_trainable(args, model_to_tune, active_layers_ids)
             if not param_to_train:
                 print('All layers are tuned!')
                 break
@@ -350,7 +361,7 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
                 lr_scheduler = transformers.get_constant_schedule_with_warmup(opt, num_warmup_steps=args.warmup)
 
         # train loop
-        model.train()
+        model_to_tune.train()
         # prepare batch indices
         batch_indices_epoch = torch.randperm(num_samples)[:epoch_samples].chunk(microbatches_per_epoch)
 
@@ -367,10 +378,15 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
                 )
 
             # with torch.autocast(device_type="cuda", enabled=args.amp):
-            outputs = model(inputs).logits
+            outputs = model_to_tune(inputs).logits
             kl_loss = kl_div(outputs, targets.to(device=outputs.device, dtype=args.finetune_dtype))
-            q_loss = 0 if Xmap is None else get_quant_noise(model, Xmap)
-            loss = kl_loss + ratio * q_loss / factor
+            q_loss = 0
+            loss = kl_loss
+            if Xmap:
+                q_loss = get_quant_noise(model_to_tune, Xmap)
+                if not(epoch == 0 and metadata["total_optimizer_steps"] == 0):
+                    loss = kl_loss + qloss_strength * q_loss / factor
+
             metadata["kl_loss_numerator"] += kl_loss.item()
             metadata["q_loss_numerator"] += q_loss
             metadata["loss_denominator"] += 1
@@ -379,7 +395,7 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
             if not torch.isfinite(loss).item():
                 raise ValueError(f"Fine-tuning loss is {loss}")
 
-            # A_before = quant_model.model._nncf.external_quantizers.FQ_LORA_for_node_layers_23_mlp_down_proj_weight._lora_A.data.clone()
+            # A_before = model_to_tune.model._nncf.external_quantizers.FQ_LORA_for_node_layers_23_mlp_down_proj_weight._lora_A.data.clone()
             # scaler.scale(loss / grad_accumulation_steps).backward()
             (loss / grad_accumulation_steps).backward()
 
@@ -400,12 +416,16 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
                 metadata["grad_steps_accumulated"] = 0
                 metadata["total_optimizer_steps"] += 1
                 metadata["aggregated_kl_loss"] = metadata["kl_loss_numerator"] / metadata["loss_denominator"]
-                metadata["aggregated_q_loss"] = ratio * metadata["q_loss_numerator"] / metadata["loss_denominator"] / factor
-                # if epoch == 0 and metadata["total_optimizer_steps"] == 1:
-                #     first_loss = metadata["aggregated_kl_loss"]
-                #     first_qloss = factor * metadata["aggregated_q_loss"] / ratio
-                #     ratio = 1/2
-                #     factor = first_qloss/first_loss
+                if Xmap is not None:
+                    if epoch == 0 and metadata["total_optimizer_steps"] == 1:
+                        first_loss = metadata["aggregated_kl_loss"]
+                        first_qloss = metadata["q_loss_numerator"] / metadata["loss_denominator"]
+                        factor = first_qloss / first_loss
+                    else:
+                        metadata["aggregated_q_loss"] = (qloss_strength / factor) * (metadata["q_loss_numerator"] / metadata["loss_denominator"])
+                else:
+                    factor = 1
+                    metadata["aggregated_q_loss"] = 0
                 metadata["aggregated_loss"] = metadata["aggregated_kl_loss"] + metadata["aggregated_q_loss"]
                 metadata["kl_loss_numerator"] = metadata["loss_denominator"] = metadata["q_loss_numerator"] = 0
 
@@ -418,7 +438,7 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
                 # layer=FQ_LORA_for_node_layers_23_self_attn_o_proj_weight - 35
 
             # NOTE: debug that some parameters updated and some - frozen
-            # A_after = quant_model.model._nncf.external_quantizers.FQ_LORA_for_node_layers_31_mlp_gate_up_proj_weight._lora_A.data
+            # A_after = model_to_tune.model._nncf.external_quantizers.FQ_LORA_for_node_layers_31_mlp_gate_up_proj_weight._lora_A.data
             # assert torch.equal(W_after, W_after)
 
             if args.print_every_steps and metadata["total_optimizer_steps"] % args.print_every_steps == 0 and metadata["grad_steps_accumulated"] == 0:
@@ -430,24 +450,57 @@ def finetune(model, train_loader, train_hiddens, args, device, ckpt_dir=None, ev
                     f"\tloss = {metadata['aggregated_kl_loss']:.9f}",
                 )
 
-            if args.wandb:
-                wandb.log(metadata, step=metadata["total_microbatches"])
+            if args.mlflow:
+                names_to_log = [
+                    'aggregated_loss',
+                    'aggregated_kl_loss',
+                    'aggregated_q_loss',
+                    'lm_eval_word_ppl',
+                    'perplexity_wikitext2',
+                    'current_epoch',
+                    '23dj_A',
+                    '23dj_gA',
+                    '23dj_B',
+                    '23dj_gB',
+                    '23dj_IL',
+                    '23dj_gIL',
+                    '23dj_IR',
+                    '23dj_gIR',
+                ]
+                log_data = OrderedDict(filter(lambda pair: pair[0] in names_to_log, metadata.items()))
+                mlflow.log_metrics(log_data, step=metadata["total_microbatches"])
 
-        # TODO: why removed eval loss ??? maybe needed??? quick and on test data
-        # TODO: run lm_eval on wikitext??
+
         # NOTE: evaluate in the end of each epoch
-        # if (epoch + 1) % args.frequency == 0:
-        # TODO: eval similarity!? with chat template
-        perplexity_scores = compute_validation_perplexities(args, model, eval_datasets)
-        for dataset_name, perplexity in perplexity_scores.items():
-            metadata[f"perplexity_{dataset_name}"] = perplexity
-        metric_name = metadata["early_stop_on"]
-        if perplexity_scores[metric_name] < metadata["best_eval_perplexity"]:
-            print(f"New best perplexity ({metric_name}) = {perplexity_scores[metric_name]:.9f}")
-            metadata["best_eval_perplexity"] = perplexity_scores[args.eval_datasets[0]]
+        # if wwb_eval:
+        #     all_metrics_per_question, all_metrics = wwb_eval.score(model_to_tune)
+        #     similarity = float(all_metrics["similarity"].iloc[0])
+        #     metadata["wwb_similarity"] = similarity
+
+        ckpt_name = 'nncf_checkpoint.pth'
+        last_dir = ckpt_dir / "last_ckpt"
+        last_dir.mkdir(exist_ok=True, parents=True)
+        save_checkpoint(model_to_tune.model, last_dir, ckpt_name)
+        word_ppl = lm_eval(args, last_dir)
+        print(word_ppl)
+        metadata["lm_eval_word_ppl"] = word_ppl
+        if word_ppl < metadata["best_eval_perplexity"]:
+            print(f"New best lm_eval word perplexity = {word_ppl:.4f}")
+            metadata["best_eval_perplexity"] = word_ppl
             metadata["best_step"] = metadata["total_optimizer_steps"]
             if args.keep_best_model:
-                save_checkpoint(model.model, ckpt_dir)
+                shutil.copy(last_dir / ckpt_name, ckpt_dir / ckpt_name)
+
+        perplexity_scores = compute_validation_perplexities(args, model_to_tune, eval_datasets)
+        for dataset_name, perplexity in perplexity_scores.items():
+            metadata[f"perplexity_{dataset_name}"] = perplexity
+        # metric_name = metadata["early_stop_on"]
+        # if perplexity_scores[metric_name] < metadata["best_eval_perplexity"]:
+        #     print(f"New best perplexity ({metric_name}) = {perplexity_scores[metric_name]:.9f}")
+        #     metadata["best_eval_perplexity"] = perplexity_scores[args.eval_datasets[0]]
+        #     metadata["best_step"] = metadata["total_optimizer_steps"]
+        #     if args.keep_best_model:
+        #         save_checkpoint(model_to_tune.model, last_dir, ckpt_name)
 
         metadata["microbatches_since_epoch_start"] = 0
         metadata["current_epoch"] += 1
@@ -457,7 +510,7 @@ def print_memory_stats():
     print(f"GPU max memory allocated: {torch.cuda.max_memory_allocated() / 2 ** 30:.2f} GB.")
     print(f"GPU max memory reserved: {torch.cuda.max_memory_reserved() / 2 ** 30:.2f} GB.")
 
-def save_checkpoint(wrapped_model, ckpt_dir):
+def save_checkpoint(wrapped_model, ckpt_dir, ckpt_name = "nncf_checkpoint.pth"):
     if not ckpt_dir.exists():
         ckpt_dir.mkdir()
     nncf_state_dict = wrapped_model.nncf.state_dict()
@@ -467,12 +520,17 @@ def save_checkpoint(wrapped_model, ckpt_dir):
             "nncf_state_dict": nncf_state_dict,
             "nncf_config": nncf_config,
         },
-        ckpt_dir / "nncf_checkpoint.pth",
+        ckpt_dir / ckpt_name,
     )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(add_help=True)
     # Model params
+    parser.add_argument(
+        "--qloss",
+        action="store_true",
+        help="Whether to use additional loss - quantization noise on calibration dataset",
+    )
     parser.add_argument(
         "--fq_lr",
         type=float,
@@ -646,7 +704,7 @@ if __name__ == "__main__":
         help="dtype to finetune the model",
     )
     # Logging params
-    parser.add_argument("--wandb", action="store_true", help="Whether to use wandb or store locally.")
+    parser.add_argument("--mlflow", action="store_true", help="Whether to use mlflow or store locally.")
     # Save params
     parser.add_argument("--exp_name", type=str, default=None, help="Path to save quantized models.")
     # Misc params
@@ -713,25 +771,19 @@ if __name__ == "__main__":
     device = "cuda"
     args.devices = [device]  # needed for perplexity eval
     is_cosine = 'cosine' if args.cosine else 'const'
-    exp_name =  args.exp_name if args.exp_name else f"slm_{is_cosine}_both_g64_rank256_lr{args.lr:.0e}_n{args.nsamples}_fqlr{args.fq_lr:.0e}_wd{args.weight_decay:.0e}_bs{args.batch_size}_rand100+_qloss_10xB"
-    if args.wandb:
-        assert has_wandb, "`wandb` not installed, try pip install `wandb`"
-        wandb.init(config=args, name=exp_name)
+    qloss = '_qloss' if args.qloss else ''
+    exp_name =  args.exp_name if args.exp_name else f"slm_{is_cosine}_lr{args.lr:.0e}_fqlr{args.fq_lr:.0e}_wd{args.weight_decay:.0e}_rand100+_10xB_sqrtS{qloss}"
+    if args.mlflow:
+        mlflow.set_experiment('Tune FQLoRA')
+        # wandb.init(config=args, name=exp_name)
+
+    ckpt_dir = Path(args.nncf_ckpt_dir) / exp_name
+    ckpt_dir.mkdir(exist_ok=True, parents=True)
 
     # get data
     train_dataloader = get_loaders(
         args.dataset,
         nsamples=args.nsamples,
-        seed=args.seed,
-        model_path=args.base_model,
-        seqlen=args.model_seqlen,
-        use_fast_tokenizer=args.use_fast_tokenizer,
-        trust_remote_code=args.trust_remote_code,
-    )
-
-    calib_dataloader = get_loaders(
-        args.dataset,
-        nsamples=12,
         seed=args.seed,
         model_path=args.base_model,
         seqlen=args.model_seqlen,
@@ -777,14 +829,32 @@ if __name__ == "__main__":
     # del orig_model
     # torch.cuda.empty_cache() # TODO:???
     Xmap = None
-    # Xmap = get_Xmap(orig_model, calib_dataloader)
+    if args.qloss:
+        calib_dataloader = get_loaders(
+            args.dataset,
+            nsamples=128,
+            seed=args.seed * 2,
+            model_path=args.base_model,
+            seqlen=args.model_seqlen,
+            use_fast_tokenizer=args.use_fast_tokenizer,
+            trust_remote_code=args.trust_remote_code,
+        )
+        Xmap = get_Xmap(orig_model, calib_dataloader)
     print(f'Caching took {(time.time() - start):.2f} seconds')
 
     # generate_overfit(orig_model, tokenizer, "FP32")
     wwb_ref = MODEL_DIR / "ref_qa.csv"
-    if not wwb_ref.exists():
-        evaluator = Evaluator(base_model=orig_model, tokenizer=tokenizer, metrics=("similarity",))
-        evaluator.dump_gt(str(wwb_ref))
+    if wwb_ref.exists():
+        print("Loading cached WWB reference answers from: ", wwb_ref.resolve())
+        wwb_eval = TextEvaluator(
+            tokenizer=tokenizer, gt_data=wwb_ref, test_data=str(wwb_ref)
+        )
+    else:
+        chat_template=[{"role": "user", "content": "input_text"}]
+        wwb_eval = TextEvaluator(
+            base_model=orig_model, tokenizer=tokenizer, chat_template=chat_template, metrics=("similarity",)
+        )
+        wwb_eval.dump_gt(str(wwb_ref))
 
     quant_model = load_nncf_quantized_model(args.nncf_ckpt_dir, orig_model, tokenizer)
     # generate_overfit(quant_model, tokenizer, "FQ")
@@ -792,38 +862,31 @@ if __name__ == "__main__":
     if not args.device_map:
         quant_model = quant_model.to(device)
 
-    ckpt_dir = Path(args.nncf_ckpt_dir) / exp_name
-    ckpt_dir.mkdir(exist_ok=True, parents=True)
+    with mlflow.start_run(run_name=exp_name):
+        mlflow.log_params(vars(args))
+        # finetune
+        finetune(
+            quant_model,
+            train_loader=train_dataloader,
+            train_hiddens=orig_train_hiddens,
+            args=args,
+            device=device,
+            ckpt_dir=ckpt_dir,
+            eval_datasets=eval_datasets,
+            Xmap=Xmap,
+            wwb_eval=wwb_eval
+        )
 
+        # generate_overfit(quant_model, tokenizer, "after tune")
+        # compute_validation_perplexities(args, quant_model, eval_datasets)
+        # last_dir = ckpt_dir / "last_ckpt"
+        # last_dir.mkdir(exist_ok=True, parents=True)
+        # save_checkpoint(quant_model.model, last_dir)
 
-    # finetune
-    finetune(
-        quant_model,
-        train_loader=train_dataloader,
-        train_hiddens=orig_train_hiddens,
-        args=args,
-        device=device,
-        ckpt_dir=ckpt_dir,
-        eval_datasets=eval_datasets,
-        Xmap=Xmap
-    )
-
-    # generate_overfit(quant_model, tokenizer, "after tune")
-
-    # compute_validation_perplexities(args, quant_model, eval_datasets)
-    # last_dir = ckpt_dir / "last_ckpt"
-    # last_dir.mkdir(exist_ok=True, parents=True)
-    # save_checkpoint(quant_model.model, last_dir)
-
-    print_memory_stats()
-
-    # TODO: why offload model to cpu??
-    # quant_model = quant_model.cpu()
-    # TODO: why is this accelerate function needed? can delete FQ?
-    # if args.device_map:
-    #     remove_hook_from_submodules(quant_model)
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    print(f"eval: {torch.cuda.max_memory_allocated()=:,}")
-    if args.wandb:
-        wandb.log({"max_cuda_mem_eval": round(torch.cuda.max_memory_allocated() / 1e9, 2)})
+        print_memory_stats()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        print(f"eval: {torch.cuda.max_memory_allocated()=:,}")
+        if args.mlflow:
+            mlflow.log_params({"max_cuda_mem_eval": round(torch.cuda.max_memory_allocated() / 1e9, 2)})
+            # wandb.log({"max_cuda_mem_eval": round(torch.cuda.max_memory_allocated() / 1e9, 2)})
