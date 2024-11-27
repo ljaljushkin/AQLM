@@ -17,13 +17,13 @@ set -e
 #         eval $command 2>&1 | tee -a 'eval.log'
 #     done
 # }
-
-# --base_model=microsoft/Phi-3-mini-4k-instruct \
-# --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_no_embed_svd_rank\${rank}_g64_hybrid_rand_quant100+/ \
+# --base_model=HuggingFaceTB/SmolLM-1.7B-Instruct \
+# --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/SmolLM-1_7B-Instruct/FQ_4bit_no_embed_svd_rank\${rank}_g64_hybrid_rand_quant100+_sqrtS/ \
 # --base_model=microsoft/Phi-3.5-mini-instruct \
-tune_command_template="python finetune.py \
---base_model=HuggingFaceTB/SmolLM-1.7B-Instruct \
---nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/SmolLM-1_7B-Instruct/FQ_4bit_no_embed_svd_rank\${rank}_g64_hybrid_rand_quant100+_sqrtS/ \
+
+tune_command_template="PYTHONIOENCODING=utf-8 python finetune.py \
+--nncf_ckpt_dir=$HOME/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_no_embed_svd_rank\${rank}_g64_hybrid_rand_quant100+_sqrtS/ \
+--base_model=microsoft/Phi-3-mini-4k-instruct \
 --model_seqlen=\$model_seqlen \
 --val_size=0   \
 --adam_beta1=0.90  \
@@ -45,9 +45,8 @@ tune_command_template="python finetune.py \
 --warmup=\$warmup \
 --dtype=bfloat16 \
 --finetune_dtype=bfloat16 \
---qloss \
 --mlflow"
-
+# --qloss \
 # --exp_name=slm_const_lr2e-04_fqlr1e-03_wd1e-03_rand100+_qloss_n1024_r1"
 # --print_every_steps=1"
 # --print_every_steps=1 \
@@ -66,7 +65,7 @@ microbatch_size=2 #2 #2
 list_nsamples=1024 #128 #128
 dataset=wikitext2
 lrs=1e-4
-fq_lrs=1e-3
+fq_lrs=1e-5
 lr_scale=0 # 1 2)
 num_blocks=32 # 8)
 frequencys=32 #2 #(8 16 32)
@@ -87,7 +86,7 @@ do
                         export rank model_seqlen batch_size microbatch_size nsamples weight_decay dataset lr fq_lr lr_scale num_blocks frequency warmup
                         command=$(echo $tune_command_template | envsubst)
                         echo "Running: $command"
-                        eval $command 2>&1 | tee -a tune.log
+                        eval $command 2>&1 | tee -a tune_$(date '+%Y-%m-%d %H:%M:%S').log
 
                         # run_commands "FQ_4bit_no_embed_svd_rank8_g64" "${ckpt_dir[@]}"
                     done

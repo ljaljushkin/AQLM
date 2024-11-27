@@ -1,6 +1,9 @@
+from contextlib import redirect_stderr
+from contextlib import redirect_stdout
 import sys
 import json
 import ast
+import pprint
 from typing import Dict, Optional, Tuple, List
 import argparse
 import subprocess
@@ -276,7 +279,7 @@ def set_trainable(args, model, list_of_indexes: List[int]):
 
     param_to_train = [
         {"params": adapters_to_train,  "lr": args.lr, "weight_decay": args.weight_decay},
-        {"params": B_adapters_to_train,  "lr": 10 * args.lr, "weight_decay": args.weight_decay},
+        {"params": B_adapters_to_train,  "lr": args.lr, "weight_decay": args.weight_decay},
         {"params": scales_to_train, "lr": args.fq_lr, "weight_decay": 0}#args.weight_decay}
     ]
     return param_to_train
@@ -491,9 +494,9 @@ def finetune(model_to_tune, train_loader, train_hiddens, args, device, ckpt_dir=
             if args.keep_best_model:
                 shutil.copy(last_dir / ckpt_name, ckpt_dir / ckpt_name)
 
-        perplexity_scores = compute_validation_perplexities(args, model_to_tune, eval_datasets)
-        for dataset_name, perplexity in perplexity_scores.items():
-            metadata[f"perplexity_{dataset_name}"] = perplexity
+        # perplexity_scores = compute_validation_perplexities(args, model_to_tune, eval_datasets)
+        # for dataset_name, perplexity in perplexity_scores.items():
+        #     metadata[f"perplexity_{dataset_name}"] = perplexity
         # metric_name = metadata["early_stop_on"]
         # if perplexity_scores[metric_name] < metadata["best_eval_perplexity"]:
         #     print(f"New best perplexity ({metric_name}) = {perplexity_scores[metric_name]:.9f}")
@@ -752,141 +755,145 @@ if __name__ == "__main__":
     )
     set_seed(42)
     args = parser.parse_args()
-    if args.keep_best_model:
-        assert args.eval_datasets is not None, f"--keep_best_model requires --eval_datasets"
-
 
     model_name = Path(args.base_model).name.replace('.', '_')
-    ROOT_MODEL_DIR = Path.home() / ("MODEL_DIR")
+    ROOT_MODEL_DIR = (Path.home() / ("MODEL_DIR")).resolve()
+    assert ROOT_MODEL_DIR.exists()
     MODEL_DIR = ROOT_MODEL_DIR / model_name
     MODEL_DIR.mkdir(exist_ok=True, parents=True)
-
-    args.microbatch_size = args.microbatch_size or args.batch_size
-    args.finetune_dtype = getattr(torch, args.finetune_dtype)
-    if args.amp:
-        assert args.finetune_dtype == torch.float32, "AMP works only with original model in fp32."
-
-    # get device
-    assert torch.cuda.is_available()
-    device = "cuda"
-    args.devices = [device]  # needed for perplexity eval
     is_cosine = 'cosine' if args.cosine else 'const'
     qloss = '_qloss' if args.qloss else ''
-    exp_name =  args.exp_name if args.exp_name else f"slm_{is_cosine}_lr{args.lr:.0e}_fqlr{args.fq_lr:.0e}_wd{args.weight_decay:.0e}_rand100+_10xB_sqrtS{qloss}"
-    if args.mlflow:
-        mlflow.set_experiment('Tune FQLoRA')
-        # wandb.init(config=args, name=exp_name)
-
+    exp_name =  args.exp_name if args.exp_name else f"phi3_{is_cosine}_lr{args.lr:.0e}_fqlr{args.fq_lr:.0e}_wd{args.weight_decay:.0e}_rand100+_sqrtS{qloss}"
     ckpt_dir = Path(args.nncf_ckpt_dir) / exp_name
     ckpt_dir.mkdir(exist_ok=True, parents=True)
+    log_filename = ckpt_dir / 'tune.log'
+    print('Log file: ', log_filename.resolve())
+    with log_filename.open("w") as f, redirect_stdout(f), redirect_stderr(f):
+        pprint.pprint(vars(args))
+        if args.mlflow:
+            mlflow.set_experiment('Tune FQLoRA')
+            # wandb.init(config=args, name=exp_name)
 
-    # get data
-    train_dataloader = get_loaders(
-        args.dataset,
-        nsamples=args.nsamples,
-        seed=args.seed,
-        model_path=args.base_model,
-        seqlen=args.model_seqlen,
-        use_fast_tokenizer=args.use_fast_tokenizer,
-        trust_remote_code=args.trust_remote_code,
-    )
+        if args.keep_best_model:
+            assert args.eval_datasets is not None, f"--keep_best_model requires --eval_datasets"
 
-    eval_datasets = {
-        dataset_name: get_loaders(
-            dataset_name,
-            seed=args.seed,
-            model_path=args.base_model,
-            seqlen=args.model_seqlen,
-            eval_mode=True,
-        )
-        for dataset_name in args.eval_datasets
-    }
+        args.microbatch_size = args.microbatch_size or args.batch_size
+        args.finetune_dtype = getattr(torch, args.finetune_dtype)
+        if args.amp:
+            assert args.finetune_dtype == torch.float32, "AMP works only with original model in fp32."
 
-    # create original model
-    orig_model = get_model(args.base_model, None, args.dtype, args.device_map, trust_remote_code=args.trust_remote_code)
-    if not args.device_map:
-        orig_model = orig_model.to(device)
-    # compute_validation_perplexities(args, orig_model, eval_datasets)
-    # exit()
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.base_model, use_fast=args.use_fast_tokenizer, trust_remote_code=True
-    )
+        # get device
+        assert torch.cuda.is_available()
+        device = "cuda"
+        args.devices = [device]  # needed for perplexity eval
 
-    # NOTE: overfit experiments
-    # train_dataloader = [tokenizer("b", return_tensors="pt")["input_ids"]]
-
-    # cache logits
-    start = time.time()
-    CACHE_DIR = MODEL_DIR / 'hiddens_cache'
-    CACHE_DIR.mkdir(exist_ok=True, parents=True)
-    TRAIN_HIDDENS_PATH = CACHE_DIR / Path(f'{model_name}_train_hiddens_n{args.nsamples}_data_{args.dataset}.pth')
-    # TRAIN_HIDDENS_PATH = CACHE_DIR / Path('blabla.pth')
-    if TRAIN_HIDDENS_PATH.exists():
-        orig_train_hiddens = torch.load(TRAIN_HIDDENS_PATH)
-    else:
-        orig_train_hiddens = cache_hiddens(orig_model, train_dataloader)
-        torch.save(orig_train_hiddens, TRAIN_HIDDENS_PATH)
-    # del orig_model
-    # torch.cuda.empty_cache() # TODO:???
-    Xmap = None
-    if args.qloss:
-        calib_dataloader = get_loaders(
+        # get data
+        train_dataloader = get_loaders(
             args.dataset,
-            nsamples=128,
-            seed=args.seed * 2,
+            nsamples=args.nsamples,
+            seed=args.seed,
             model_path=args.base_model,
             seqlen=args.model_seqlen,
             use_fast_tokenizer=args.use_fast_tokenizer,
             trust_remote_code=args.trust_remote_code,
         )
-        Xmap = get_Xmap(orig_model, calib_dataloader)
-    print(f'Caching took {(time.time() - start):.2f} seconds')
 
-    # generate_overfit(orig_model, tokenizer, "FP32")
-    wwb_ref = MODEL_DIR / "ref_qa.csv"
-    if wwb_ref.exists():
-        print("Loading cached WWB reference answers from: ", wwb_ref.resolve())
-        wwb_eval = TextEvaluator(
-            tokenizer=tokenizer, gt_data=wwb_ref, test_data=str(wwb_ref)
-        )
-    else:
-        chat_template=[{"role": "user", "content": "input_text"}]
-        wwb_eval = TextEvaluator(
-            base_model=orig_model, tokenizer=tokenizer, chat_template=chat_template, metrics=("similarity",)
-        )
-        wwb_eval.dump_gt(str(wwb_ref))
+        eval_datasets = {
+            dataset_name: get_loaders(
+                dataset_name,
+                seed=args.seed,
+                model_path=args.base_model,
+                seqlen=args.model_seqlen,
+                eval_mode=True,
+            )
+            for dataset_name in args.eval_datasets
+        }
 
-    quant_model = load_nncf_quantized_model(args.nncf_ckpt_dir, orig_model, tokenizer)
-    # generate_overfit(quant_model, tokenizer, "FQ")
-    # compute_validation_perplexities(args, quant_model, eval_datasets)
-    if not args.device_map:
-        quant_model = quant_model.to(device)
-
-    with mlflow.start_run(run_name=exp_name):
-        mlflow.log_params(vars(args))
-        # finetune
-        finetune(
-            quant_model,
-            train_loader=train_dataloader,
-            train_hiddens=orig_train_hiddens,
-            args=args,
-            device=device,
-            ckpt_dir=ckpt_dir,
-            eval_datasets=eval_datasets,
-            Xmap=Xmap,
-            wwb_eval=wwb_eval
+        # create original model
+        orig_model = get_model(args.base_model, None, args.dtype, args.device_map, trust_remote_code=args.trust_remote_code)
+        if not args.device_map:
+            orig_model = orig_model.to(device)
+        # compute_validation_perplexities(args, orig_model, eval_datasets)
+        # exit()
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.base_model, use_fast=args.use_fast_tokenizer, trust_remote_code=True
         )
 
-        # generate_overfit(quant_model, tokenizer, "after tune")
+        # NOTE: overfit experiments
+        # train_dataloader = [tokenizer("b", return_tensors="pt")["input_ids"]]
+
+        # cache logits
+        start = time.time()
+        CACHE_DIR = MODEL_DIR / 'hiddens_cache'
+        CACHE_DIR.mkdir(exist_ok=True, parents=True)
+        TRAIN_HIDDENS_PATH = CACHE_DIR / Path(f'{model_name}_train_hiddens_n{args.nsamples}_data_{args.dataset}.pth')
+        # TRAIN_HIDDENS_PATH = CACHE_DIR / Path('blabla.pth')
+        if TRAIN_HIDDENS_PATH.exists():
+            orig_train_hiddens = torch.load(TRAIN_HIDDENS_PATH)
+        else:
+            orig_train_hiddens = cache_hiddens(orig_model, train_dataloader)
+            torch.save(orig_train_hiddens, TRAIN_HIDDENS_PATH)
+        # del orig_model
+        # torch.cuda.empty_cache() # TODO:???
+        Xmap = None
+        if args.qloss:
+            calib_dataloader = get_loaders(
+                args.dataset,
+                nsamples=128,
+                seed=args.seed * 2,
+                model_path=args.base_model,
+                seqlen=args.model_seqlen,
+                use_fast_tokenizer=args.use_fast_tokenizer,
+                trust_remote_code=args.trust_remote_code,
+            )
+            Xmap = get_Xmap(orig_model, calib_dataloader)
+        print(f'Caching took {(time.time() - start):.2f} seconds')
+
+        # generate_overfit(orig_model, tokenizer, "FP32")
+        wwb_ref = MODEL_DIR / "ref_qa.csv"
+        if wwb_ref.exists():
+            print("Loading cached WWB reference answers from: ", wwb_ref.resolve())
+            wwb_eval = TextEvaluator(
+                tokenizer=tokenizer, gt_data=wwb_ref, test_data=str(wwb_ref)
+            )
+        else:
+            chat_template=[{"role": "user", "content": "input_text"}]
+            wwb_eval = TextEvaluator(
+                base_model=orig_model, tokenizer=tokenizer, chat_template=chat_template, metrics=("similarity",)
+            )
+            wwb_eval.dump_gt(str(wwb_ref))
+
+        quant_model = load_nncf_quantized_model(args.nncf_ckpt_dir, orig_model, tokenizer)
+        # generate_overfit(quant_model, tokenizer, "FQ")
         # compute_validation_perplexities(args, quant_model, eval_datasets)
-        # last_dir = ckpt_dir / "last_ckpt"
-        # last_dir.mkdir(exist_ok=True, parents=True)
-        # save_checkpoint(quant_model.model, last_dir)
+        if not args.device_map:
+            quant_model = quant_model.to(device)
 
-        print_memory_stats()
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        print(f"eval: {torch.cuda.max_memory_allocated()=:,}")
-        if args.mlflow:
-            mlflow.log_params({"max_cuda_mem_eval": round(torch.cuda.max_memory_allocated() / 1e9, 2)})
-            # wandb.log({"max_cuda_mem_eval": round(torch.cuda.max_memory_allocated() / 1e9, 2)})
+        with mlflow.start_run(run_name=exp_name):
+            mlflow.log_params(vars(args))
+            # finetune
+            finetune(
+                quant_model,
+                train_loader=train_dataloader,
+                train_hiddens=orig_train_hiddens,
+                args=args,
+                device=device,
+                ckpt_dir=ckpt_dir,
+                eval_datasets=eval_datasets,
+                Xmap=Xmap,
+                wwb_eval=wwb_eval
+            )
+
+            # generate_overfit(quant_model, tokenizer, "after tune")
+            # compute_validation_perplexities(args, quant_model, eval_datasets)
+            # last_dir = ckpt_dir / "last_ckpt"
+            # last_dir.mkdir(exist_ok=True, parents=True)
+            # save_checkpoint(quant_model.model, last_dir)
+
+            print_memory_stats()
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            print(f"eval: {torch.cuda.max_memory_allocated()=:,}")
+            if args.mlflow:
+                mlflow.log_params({"max_cuda_mem_eval": round(torch.cuda.max_memory_allocated() / 1e9, 2)})
+                # wandb.log({"max_cuda_mem_eval": round(torch.cuda.max_memory_allocated() / 1e9, 2)})
