@@ -1,11 +1,21 @@
-# ROOT_DIR="/home/nlyaly/MODEL_DIR/Phi-3_5-mini-instruct"
-# command_template='lm_eval --model=hf --model_args=pretrained=microsoft/Phi-3.5-mini-instruct,trust_remote_code=True,nncf_ckpt_dir=${nncf_ckpt_dir},dtype=auto,device_map=auto,parallelize=True,max_length=4096 --tasks=wikitext'
 
-# ROOT_DIR="/home/nlyaly/MODEL_DIR/SmolLM-1_7B-Instruct"
-# command_template='lm_eval --model=hf --model_args=pretrained=HuggingFaceTB/SmolLM-1.7B-Instruct,trust_remote_code=True,nncf_ckpt_dir=${nncf_ckpt_dir},device_map=auto,parallelize=True,dtype=bfloat16 --tasks=wikitext'
+BASE_MODEL="HuggingFaceTB/SmolLM-1.7B-Instruct"
+MODEL_NAME="SmolLM-1_7B-Instruct"
 
-ROOT_DIR="/home/nlyaly/MODEL_DIR/Phi-3-mini-4k-instruct"
-command_template='lm_eval --model=hf --model_args=pretrained=microsoft/Phi-3-mini-4k-instruct,trust_remote_code=True,nncf_ckpt_dir=${nncf_ckpt_dir},device_map=auto,parallelize=True,dtype=bfloat16 --tasks=wikitext'
+BASE_MODEL="microsoft/Phi-3-mini-4k-instruct"
+MODEL_NAME="Phi-3-mini-4k-instruct"
+
+BASE_MODEL="microsoft/Phi-3.5-mini-instruct"
+MODEL_NAME="Phi-3_5-mini-instruct"
+
+BASE_MODEL="Qwen/Qwen2.5-3B-Instruct"
+MODEL_NAME="Qwen2_5-3B-Instruct"
+
+# BASE_MODEL="google/gemma-2-2b-it"
+# MODEL_NAME="gemma-2-2b-it"
+
+ROOT_DIR="$HOME/MODEL_DIR/$MODEL_NAME"
+command_template="lm_eval --model=hf --model_args=pretrained=${BASE_MODEL},trust_remote_code=True,nncf_ckpt_dir=\${nncf_ckpt_dir},dtype=bfloat16 --tasks=wikitext"
 
 rank8_names=(
     # weekend_rank8_g64_seqlen1024_lr0.0005_lr_scale0_n128
@@ -34,7 +44,8 @@ rank8_names=(
     # slm_const_both_g64_rank256_lr1e-04_n1024_fqlr1e-03_wd1e-04_bs32_rand100+_qloss_10xB
     # slm_const_lr2e-04_fqlr1e-03_wd1e-03_rand100+_qloss_n1024_r1
     # slm_const_both_g64_rank256_lr1e-04_n1024_fqlr1e-03_wd0e+00_bs32_rand100+_qloss_10xB
-    slm_const_lr1e-04_fqlr1e-03_wd1e-03_rand100+_qloss_n128_r0.5
+    # slm_const_lr1e-04_fqlr1e-03_wd1e-03_rand100+_qloss_n128_r0.5
+    qwen_datawikitext2_lr5e-04_fqlr5e-05_wd5e-04_seqlen1024_n1024_rand100+_sqrtS
 )
 
 # svd_names=(
@@ -67,7 +78,7 @@ run_commands() {
 
 # run_commands "FQ_4bit_no_embed_svd_rank256_g64_bfloat16" "${rank8_names[@]}"
 # run_commands "FQ_4bit_no_embed_svd_rank256_g64_float32" "${rank8_names[@]}"
- run_commands "FQ_4bit_no_embed_svd_rank256_g64_hybrid_rand_quant100+" "${rank8_names[@]}"
+run_commands "FQ_4bit_no_embed_svd_rank256_g64_hybrid_rand_quant100+_sqrtS" "${rank8_names[@]}"
 
 # run_commands "./" "${svd_names[@]}"
 

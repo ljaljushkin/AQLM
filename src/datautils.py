@@ -1,7 +1,7 @@
 import os
 import random
 from typing import Optional
-
+from pathlib import Path
 import datasets
 import numpy as np
 import torch
@@ -9,7 +9,7 @@ from datasets import load_dataset
 from packaging import version
 from tqdm import trange
 from transformers import AutoTokenizer, LlamaTokenizer
-
+import json
 
 def set_seed(seed: Optional[int]):
     random.seed(seed)
@@ -20,7 +20,7 @@ def set_seed(seed: Optional[int]):
 def get_red_pajama(nsamples, seqlen, tokenizer, eval_mode=False):
     print("Loading red_pajama from togethercomputer/RedPajama-Data-1T-Sample")
     assert not eval_mode, "Only train set is supported in RedPajama"
-    traindata = load_dataset("togethercomputer/RedPajama-Data-1T-Sample", split="train")
+    traindata = load_dataset("togethercomputer/RedPajama-Data-1T-Sample", split="train", trust_remote_code=True)
     tokenizer.bos_token_id = 1
     tokenizer.eos_token_id = 2
     trainloader = []
@@ -37,16 +37,46 @@ def get_red_pajama(nsamples, seqlen, tokenizer, eval_mode=False):
         trainloader.append(inp)
     return trainloader
 
+def get_synthetic_as_is(model_id, tokenizer):
+    ROOT_DIR = Path('/local_ssd2/nlyalyus/projects/aqlm/gen_data')
+    model_name = Path(model_id).name.replace('.', '_')
+    filename = f"{model_name}_gen.chunk.01.jsonl"
+    dataset_path = ROOT_DIR / filename
+    print("Loading syntehtic from ", dataset_path)
+    trainloader = []
+    for line in dataset_path.open("r"):
+        text = json.loads(line)["text"]
+        train_enc = tokenizer(text, return_tensors="pt").input_ids
+        # TODO: need to pad, since concat is happening for batching, can run with batch=1
+        print('shape=', train_enc.shape)
+        trainloader.append(train_enc)
+    return trainloader
+
+
+def get_synthetic_packed(nsamples, seqlen, tokenizer, model_id):
+    ROOT_DIR = Path('/local_ssd2/nlyalyus/projects/aqlm/gen_data')
+    model_name = Path(model_id).name.replace('.', '_')
+    filename = f"{model_name}_gen.chunk.01.jsonl"
+    dataset_path = ROOT_DIR / filename
+    print("Loading syntehtic from ", dataset_path)
+    concated_text = "\n\n".join(json.loads(line)["text"] for line in dataset_path.open("r"))
+    train_enc = tokenizer(concated_text, return_tensors="pt").input_ids
+    print('shape=', train_enc.shape, ' nsamples=', train_enc.shape[1] // seqlen)
+    trainloader = torch.split(train_enc, seqlen, dim=1)[:-1]
+    return trainloader
+
 
 def get_wikitext2(nsamples, seqlen, tokenizer, eval_mode=False):
     if not eval_mode:
         traindata = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
         trainenc = tokenizer("\n\n".join(traindata["text"]), return_tensors="pt")
+        print(type(trainenc), trainenc)
         trainloader = []
         for _ in range(nsamples):
             i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
             j = i + seqlen
             inp = trainenc.input_ids[:, i:j]
+            print('shape=', inp.shape)
             trainloader.append(inp)
         return trainloader
     else:
@@ -181,6 +211,7 @@ def get_loaders(
     model_path=None,
     use_fast_tokenizer=False,
     trust_remote_code=None,
+    model_id=None
 ):
     """
     Loads and prepares data for a Transformers model.
@@ -237,6 +268,8 @@ def get_loaders(
             data = get_c4(nsamples, seqlen, tokenizer, eval_mode=eval_mode)
         elif name.lower() == "c4_new":
             data = get_c4_new(nsamples, seqlen, tokenizer, eval_mode=eval_mode)
+        elif name.lower() == "synth":
+            data = get_synthetic_packed(nsamples, seqlen, tokenizer, model_id)
         else:
             raise ValueError(
                 f"Failed to load data from {name}.",

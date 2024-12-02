@@ -1,0 +1,1 @@
+PYTHONIOENCODING=utf-8 python gen_data.py

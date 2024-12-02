@@ -25,7 +25,7 @@ import mlflow
 from collections import OrderedDict
 
 from main import perplexity_eval
-from src.datautils import get_loaders
+from src.datautils import get_loaders, get_synthetic_as_is
 from src.modelutils import get_layers, get_model, save_not_quantized_weights
 from src.utils import _extract_into_tensor, maybe_get_0th_element
 from transformers import (
@@ -71,7 +71,7 @@ def get_quant_noise(quant_model, Xmap):
 
 def lm_eval(args, ckpt_dir):
     result_path = ckpt_dir / "results.json"
-    cmd = f"lm_eval --model=hf --model_args=pretrained={args.base_model},trust_remote_code=True,nncf_ckpt_dir={ckpt_dir},device_map=auto,parallelize=True,dtype=bfloat16 --tasks=wikitext --output_path={result_path}"
+    cmd = f"lm_eval --model=hf --model_args=pretrained={args.base_model},trust_remote_code=True,nncf_ckpt_dir={ckpt_dir},device_map=auto,parallelize=True,dtype=bfloat16,max_length=4096 --tasks=wikitext --output_path={result_path}"
     sys.stdout.flush()
     subprocess.run(cmd.split(' '))
     with result_path.open('r') as f:
@@ -493,6 +493,7 @@ def finetune(model_to_tune, train_loader, train_hiddens, args, device, ckpt_dir=
             metadata["best_step"] = metadata["total_optimizer_steps"]
             if args.keep_best_model:
                 shutil.copy(last_dir / ckpt_name, ckpt_dir / ckpt_name)
+                shutil.copy(last_dir / "results.json", ckpt_dir / "results.json")
 
         # perplexity_scores = compute_validation_perplexities(args, model_to_tune, eval_datasets)
         # for dataset_name, perplexity in perplexity_scores.items():
@@ -763,16 +764,20 @@ if __name__ == "__main__":
     MODEL_DIR.mkdir(exist_ok=True, parents=True)
     is_cosine = 'cosine' if args.cosine else 'const'
     qloss = '_qloss' if args.qloss else ''
-    exp_name =  args.exp_name if args.exp_name else f"phi3_{is_cosine}_lr{args.lr:.0e}_fqlr{args.fq_lr:.0e}_wd{args.weight_decay:.0e}_rand100+_sqrtS{qloss}"
+    exp_name =  args.exp_name if args.exp_name else f"{model_name[:5]}_synth_lr{args.lr:.0e}_fqlr{args.fq_lr:.0e}_wd{args.weight_decay:.0e}_n128_rand100+_sqrtS{qloss}"
     ckpt_dir = Path(args.nncf_ckpt_dir) / exp_name
     ckpt_dir.mkdir(exist_ok=True, parents=True)
     log_filename = ckpt_dir / 'tune.log'
     print('Log file: ', log_filename.resolve())
+    sys.stdout.flush()
     with log_filename.open("w") as f, redirect_stdout(f), redirect_stderr(f):
         pprint.pprint(vars(args))
         if args.mlflow:
             mlflow.set_experiment('Tune FQLoRA')
             # wandb.init(config=args, name=exp_name)
+
+        # word_ppl = lm_eval(args, Path(args.nncf_ckpt_dir))
+        # print('word ppl for int4 init', word_ppl)
 
         if args.keep_best_model:
             assert args.eval_datasets is not None, f"--keep_best_model requires --eval_datasets"
@@ -787,6 +792,10 @@ if __name__ == "__main__":
         device = "cuda"
         args.devices = [device]  # needed for perplexity eval
 
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.base_model, use_fast=args.use_fast_tokenizer, trust_remote_code=True
+        )
+
         # get data
         train_dataloader = get_loaders(
             args.dataset,
@@ -796,18 +805,19 @@ if __name__ == "__main__":
             seqlen=args.model_seqlen,
             use_fast_tokenizer=args.use_fast_tokenizer,
             trust_remote_code=args.trust_remote_code,
+            model_id=args.base_model
         )
-
-        eval_datasets = {
-            dataset_name: get_loaders(
-                dataset_name,
-                seed=args.seed,
-                model_path=args.base_model,
-                seqlen=args.model_seqlen,
-                eval_mode=True,
-            )
-            for dataset_name in args.eval_datasets
-        }
+        eval_datasets = None
+        # eval_datasets = {
+        #     dataset_name: get_loaders(
+        #         dataset_name,
+        #         seed=args.seed,
+        #         model_path=args.base_model,
+        #         seqlen=args.model_seqlen,
+        #         eval_mode=True,
+        #     )
+        #     for dataset_name in args.eval_datasets
+        # }
 
         # create original model
         orig_model = get_model(args.base_model, None, args.dtype, args.device_map, trust_remote_code=args.trust_remote_code)
@@ -815,9 +825,7 @@ if __name__ == "__main__":
             orig_model = orig_model.to(device)
         # compute_validation_perplexities(args, orig_model, eval_datasets)
         # exit()
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.base_model, use_fast=args.use_fast_tokenizer, trust_remote_code=True
-        )
+
 
         # NOTE: overfit experiments
         # train_dataloader = [tokenizer("b", return_tensors="pt")["input_ids"]]
@@ -826,7 +834,10 @@ if __name__ == "__main__":
         start = time.time()
         CACHE_DIR = MODEL_DIR / 'hiddens_cache'
         CACHE_DIR.mkdir(exist_ok=True, parents=True)
-        TRAIN_HIDDENS_PATH = CACHE_DIR / Path(f'{model_name}_train_hiddens_n{args.nsamples}_data_{args.dataset}.pth')
+        if args.model_seqlen == 1024:
+            TRAIN_HIDDENS_PATH = CACHE_DIR / Path(f'{model_name}_train_hiddens_n{len(train_dataloader)}_data_{args.dataset}.pth')
+        else:
+            TRAIN_HIDDENS_PATH = CACHE_DIR / Path(f'{model_name}_train_hiddens_s{args.model_seqlen}_n{len(train_dataloader)}_data_{args.dataset}.pth')
         # TRAIN_HIDDENS_PATH = CACHE_DIR / Path('blabla.pth')
         if TRAIN_HIDDENS_PATH.exists():
             orig_train_hiddens = torch.load(TRAIN_HIDDENS_PATH)
@@ -869,31 +880,36 @@ if __name__ == "__main__":
         if not args.device_map:
             quant_model = quant_model.to(device)
 
-        with mlflow.start_run(run_name=exp_name):
-            mlflow.log_params(vars(args))
-            # finetune
-            finetune(
-                quant_model,
-                train_loader=train_dataloader,
-                train_hiddens=orig_train_hiddens,
-                args=args,
-                device=device,
-                ckpt_dir=ckpt_dir,
-                eval_datasets=eval_datasets,
-                Xmap=Xmap,
-                wwb_eval=wwb_eval
-            )
+        with mlflow.start_run(run_name=exp_name) as run:
+            try:
+                print(f"Run ID: {run.info.run_id}")
+                mlflow.log_params(vars(args))
+                # finetune
+                finetune(
+                    quant_model,
+                    train_loader=train_dataloader,
+                    train_hiddens=orig_train_hiddens,
+                    args=args,
+                    device=device,
+                    ckpt_dir=ckpt_dir,
+                    eval_datasets=eval_datasets,
+                    Xmap=Xmap,
+                    wwb_eval=wwb_eval
+                )
 
-            # generate_overfit(quant_model, tokenizer, "after tune")
-            # compute_validation_perplexities(args, quant_model, eval_datasets)
-            # last_dir = ckpt_dir / "last_ckpt"
-            # last_dir.mkdir(exist_ok=True, parents=True)
-            # save_checkpoint(quant_model.model, last_dir)
+                # generate_overfit(quant_model, tokenizer, "after tune")
+                # compute_validation_perplexities(args, quant_model, eval_datasets)
+                # last_dir = ckpt_dir / "last_ckpt"
+                # last_dir.mkdir(exist_ok=True, parents=True)
+                # save_checkpoint(quant_model.model, last_dir)
 
-            print_memory_stats()
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
-            print(f"eval: {torch.cuda.max_memory_allocated()=:,}")
-            if args.mlflow:
-                mlflow.log_params({"max_cuda_mem_eval": round(torch.cuda.max_memory_allocated() / 1e9, 2)})
-                # wandb.log({"max_cuda_mem_eval": round(torch.cuda.max_memory_allocated() / 1e9, 2)})
+                print_memory_stats()
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
+                print(f"eval: {torch.cuda.max_memory_allocated()=:,}")
+                if args.mlflow:
+                    mlflow.log_params({"max_cuda_mem_eval": round(torch.cuda.max_memory_allocated() / 1e9, 2)})
+                    # wandb.log({"max_cuda_mem_eval": round(torch.cuda.max_memory_allocated() / 1e9, 2)})
+            finally:
+                print('Adding log to artifacts: ', log_filename)
+                mlflow.log_artifact(log_filename)

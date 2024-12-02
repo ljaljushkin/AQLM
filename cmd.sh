@@ -17,13 +17,25 @@ set -e
 #         eval $command 2>&1 | tee -a 'eval.log'
 #     done
 # }
-# --base_model=HuggingFaceTB/SmolLM-1.7B-Instruct \
-# --nncf_ckpt_dir=/home/nlyaly/MODEL_DIR/SmolLM-1_7B-Instruct/FQ_4bit_no_embed_svd_rank\${rank}_g64_hybrid_rand_quant100+_sqrtS/ \
-# --base_model=microsoft/Phi-3.5-mini-instruct \
+
+BASE_MODEL="HuggingFaceTB/SmolLM-1.7B-Instruct"
+MODEL_NAME="SmolLM-1_7B-Instruct"
+
+BASE_MODEL="microsoft/Phi-3-mini-4k-instruct"
+MODEL_NAME="Phi-3-mini-4k-instruct"
+
+BASE_MODEL="microsoft/Phi-3.5-mini-instruct"
+MODEL_NAME="Phi-3_5-mini-instruct"
+
+# BASE_MODEL="Qwen/Qwen2.5-3B-Instruct"
+# MODEL_NAME="Qwen2_5-3B-Instruct"
+
+# BASE_MODEL="google/gemma-2-2b-it"
+# MODEL_NAME="gemma-2-2b-it"
 
 tune_command_template="PYTHONIOENCODING=utf-8 python finetune.py \
---nncf_ckpt_dir=$HOME/MODEL_DIR/Phi-3-mini-4k-instruct/FQ_4bit_no_embed_svd_rank\${rank}_g64_hybrid_rand_quant100+_sqrtS/ \
---base_model=microsoft/Phi-3-mini-4k-instruct \
+--nncf_ckpt_dir=$HOME/MODEL_DIR/$MODEL_NAME/FQ_4bit_no_embed_svd_rank\${rank}_g64_hybrid_rand_quant100+_sqrtS/ \
+--base_model=$BASE_MODEL \
 --model_seqlen=\$model_seqlen \
 --val_size=0   \
 --adam_beta1=0.90  \
@@ -46,6 +58,7 @@ tune_command_template="PYTHONIOENCODING=utf-8 python finetune.py \
 --dtype=bfloat16 \
 --finetune_dtype=bfloat16 \
 --mlflow"
+
 # --qloss \
 # --exp_name=slm_const_lr2e-04_fqlr1e-03_wd1e-03_rand100+_qloss_n1024_r1"
 # --print_every_steps=1"
@@ -62,8 +75,8 @@ rank=256
 model_seqlen=1024
 batch_sizes=32 #(128 64) #32
 microbatch_size=2 #2 #2
-list_nsamples=1024 #128 #128
-dataset=wikitext2
+list_nsamples=128 #128 #128
+dataset=synth
 lrs=1e-4
 fq_lrs=1e-5
 lr_scale=0 # 1 2)
@@ -86,7 +99,7 @@ do
                         export rank model_seqlen batch_size microbatch_size nsamples weight_decay dataset lr fq_lr lr_scale num_blocks frequency warmup
                         command=$(echo $tune_command_template | envsubst)
                         echo "Running: $command"
-                        eval $command 2>&1 | tee -a tune_$(date '+%Y-%m-%d %H:%M:%S').log
+                        eval $command 2>&1 | tee -a "tune_${MODEL_NAME}_$(date '+%Y-%m-%d_%H:%M:%S').log" # _$(date '+%Y-%m-%d_%H:%M:%S')
 
                         # run_commands "FQ_4bit_no_embed_svd_rank8_g64" "${ckpt_dir[@]}"
                     done
