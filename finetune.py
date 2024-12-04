@@ -174,6 +174,13 @@ def cache_hiddens(model, dataloader):
         # with torch.autocast(device_type="cuda", enabled=args.amp):
         batch = maybe_get_0th_element(dataloader[i]).to(device)
         cached_hiddens.append(model.model(batch).last_hidden_state.cpu())
+        # template = "Instruction:\n{instruction}\n\nResponse:\n{response}"
+        # data.append(template.format(**dataloader[i]))
+        # prompt = instruction + start_token
+        # messages = [
+        #     {"role": "user", "content": i + r},
+        # ]
+        # input_ids = tokenizer.apply_chat_template(messages, return_tensors="pt", return_dict=True).to("cuda")
     return cached_hiddens
 
 
@@ -259,28 +266,28 @@ def set_trainable(args, model, list_of_indexes: List[int]):
     for name, param in model.named_parameters():
         for index in list_of_indexes:
             # if f"layers_{index}_" in name and word_to_find in name:
-            if f"layers_{index}_" in name and "lora_A" in name:
+            if f"layers_{index}_" in name and "lora_A" in name:# and "self_attn" in name:
                 param.requires_grad = True
                 adapters_to_train.append(param)
                 break
-            if f"layers_{index}_" in name and "lora_B" in name:
+            if f"layers_{index}_" in name and "lora_B" in name:# and "self_attn" in name:
                 param.requires_grad = True
                 B_adapters_to_train.append(param)
                 break
-            if f"layers_{index}_" in name and "input" in name:
+            if f"layers_{index}_" in name and "input" in name:# and "self_attn" in name:
                 param.requires_grad = True
                 scales_to_train.append(param)
                 break
 
-    # for name, param in model.named_parameters():
-    #     if param.requires_grad:
-    #         print('Tune: ', name)
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print('Tune: ', name)
     print_trainable_parameters(model)
 
     param_to_train = [
         {"params": adapters_to_train,  "lr": args.lr, "weight_decay": args.weight_decay},
         {"params": B_adapters_to_train,  "lr": args.lr, "weight_decay": args.weight_decay},
-        {"params": scales_to_train, "lr": args.fq_lr, "weight_decay": 0}#args.weight_decay}
+        {"params": scales_to_train, "lr": args.fq_lr, "weight_decay": args.weight_decay}
     ]
     return param_to_train
 
@@ -333,14 +340,14 @@ def finetune(model_to_tune, train_loader, train_hiddens, args, device, ckpt_dir=
     # num_epochs = args.epochs
     num_training_steps = epoch_samples // args.batch_size
     cached_targets = None
-    layer = model_to_tune.model._nncf.external_quantizers.FQ_LORA_for_node_layers_23_mlp_down_proj_weight
+    layer = model_to_tune.model._nncf.external_quantizers.FQ_LORA_for_node_layers_13_mlp_down_proj_weight
     qloss_strength = 1/2
     for epoch in range(num_epochs):
         if epoch % args.frequency == 0:
             i_switch = epoch // args.frequency
             metadata["num_tuned_blocks"] = i_switch * args.num_blocks
             active_layers_ids = list(range(i_switch * args.num_blocks, (i_switch + 1) * args.num_blocks))
-            # active_layers_ids = list(range(23,24))
+            # active_layers_ids = list(range(25,26))
             param_to_train = set_trainable(args, model_to_tune, active_layers_ids)
             if not param_to_train:
                 print('All layers are tuned!')
@@ -351,7 +358,7 @@ def finetune(model_to_tune, train_loader, train_hiddens, args, device, ckpt_dir=
             # scaled_lr = args.lr * (1 + args.lr_scale * (i_switch / num_switches))
             # scaled_lr = scaled_lr if is_lora else scaled_lr / 50
             # metadata["scaled_lr"] = scaled_lr
-            opt = torch.optim.AdamW(param_to_train, betas=(args.adam_beta1, args.adam_beta2))
+            opt = torch.optim.AdamW(param_to_train)#, betas=(args.adam_beta1, args.adam_beta2))
             # scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
             if args.cosine:
                 lr_scheduler = transformers.get_cosine_schedule_with_warmup(
@@ -402,10 +409,12 @@ def finetune(model_to_tune, train_loader, train_hiddens, args, device, ckpt_dir=
             # scaler.scale(loss / grad_accumulation_steps).backward()
             (loss / grad_accumulation_steps).backward()
 
-            metadata["23dj_gA"] = torch.linalg.norm(layer._lora_A.grad.data).item()
-            metadata["23dj_gB"] = torch.linalg.norm(layer._lora_B.grad.data).item()
-            metadata["23dj_gIL"] = torch.linalg.norm(layer.input_low.grad.data).item()
-            metadata["23dj_gIR"] = torch.linalg.norm(layer.input_range.grad.data).item()
+            if layer._lora_A.grad is not None:
+                metadata["23dj_gA"] = torch.linalg.norm(layer._lora_A.grad.data).item()
+                metadata["23dj_gB"] = torch.linalg.norm(layer._lora_B.grad.data).item()
+            if layer.input_low.grad is not None:
+                metadata["23dj_gIL"] = torch.linalg.norm(layer.input_low.grad.data).item()
+                metadata["23dj_gIR"] = torch.linalg.norm(layer.input_range.grad.data).item()
 
             if metadata["grad_steps_accumulated"] == grad_accumulation_steps:
                 # print('step')
@@ -479,6 +488,7 @@ def finetune(model_to_tune, train_loader, train_hiddens, args, device, ckpt_dir=
         #     all_metrics_per_question, all_metrics = wwb_eval.score(model_to_tune)
         #     similarity = float(all_metrics["similarity"].iloc[0])
         #     metadata["wwb_similarity"] = similarity
+        #     print('Similarity: ', similarity)
 
         ckpt_name = 'nncf_checkpoint.pth'
         last_dir = ckpt_dir / "last_ckpt"
@@ -764,7 +774,7 @@ if __name__ == "__main__":
     MODEL_DIR.mkdir(exist_ok=True, parents=True)
     is_cosine = 'cosine' if args.cosine else 'const'
     qloss = '_qloss' if args.qloss else ''
-    exp_name =  args.exp_name if args.exp_name else f"{model_name[:5]}_synth_lr{args.lr:.0e}_fqlr{args.fq_lr:.0e}_wd{args.weight_decay:.0e}_n128_rand100+_sqrtS{qloss}"
+    exp_name =  args.exp_name if args.exp_name else f"{model_name[:5]}_{args.dataset}_lr{args.lr:.0e}_fqlr{args.fq_lr:.0e}_wd{args.weight_decay:.0e}_n{args.nsamples}_bs{args.batch_size}"
     ckpt_dir = Path(args.nncf_ckpt_dir) / exp_name
     ckpt_dir.mkdir(exist_ok=True, parents=True)
     log_filename = ckpt_dir / 'tune.log'
@@ -776,8 +786,8 @@ if __name__ == "__main__":
             mlflow.set_experiment('Tune FQLoRA')
             # wandb.init(config=args, name=exp_name)
 
-        # word_ppl = lm_eval(args, Path(args.nncf_ckpt_dir))
-        # print('word ppl for int4 init', word_ppl)
+        word_ppl = lm_eval(args, Path(args.nncf_ckpt_dir))
+        print('word ppl for int4 init', word_ppl)
 
         if args.keep_best_model:
             assert args.eval_datasets is not None, f"--keep_best_model requires --eval_datasets"
@@ -840,10 +850,12 @@ if __name__ == "__main__":
             TRAIN_HIDDENS_PATH = CACHE_DIR / Path(f'{model_name}_train_hiddens_s{args.model_seqlen}_n{len(train_dataloader)}_data_{args.dataset}.pth')
         # TRAIN_HIDDENS_PATH = CACHE_DIR / Path('blabla.pth')
         if TRAIN_HIDDENS_PATH.exists():
+            print('Load cached hiddens from: ', TRAIN_HIDDENS_PATH.resolve())
             orig_train_hiddens = torch.load(TRAIN_HIDDENS_PATH)
         else:
             orig_train_hiddens = cache_hiddens(orig_model, train_dataloader)
             torch.save(orig_train_hiddens, TRAIN_HIDDENS_PATH)
+            print('Save cached hiddens to: ', TRAIN_HIDDENS_PATH.resolve())
         # del orig_model
         # torch.cuda.empty_cache() # TODO:???
         Xmap = None
@@ -862,21 +874,26 @@ if __name__ == "__main__":
 
         # generate_overfit(orig_model, tokenizer, "FP32")
         wwb_ref = MODEL_DIR / "ref_qa.csv"
+        wwb_eval = None
         if wwb_ref.exists():
             print("Loading cached WWB reference answers from: ", wwb_ref.resolve())
             wwb_eval = TextEvaluator(
                 tokenizer=tokenizer, gt_data=wwb_ref, test_data=str(wwb_ref)
             )
-        else:
-            chat_template=[{"role": "user", "content": "input_text"}]
-            wwb_eval = TextEvaluator(
-                base_model=orig_model, tokenizer=tokenizer, chat_template=chat_template, metrics=("similarity",)
-            )
-            wwb_eval.dump_gt(str(wwb_ref))
+        # else:
+        #     chat_template=[{"role": "user", "content": "input_text"}]
+        #     wwb_eval = TextEvaluator(
+        #         base_model=orig_model, tokenizer=tokenizer, chat_template=chat_template, metrics=("similarity",)
+        #     )
+        #     wwb_eval.dump_gt(str(wwb_ref))
 
         quant_model = load_nncf_quantized_model(args.nncf_ckpt_dir, orig_model, tokenizer)
+        print('NNCF model device=', quant_model.device)
         # generate_overfit(quant_model, tokenizer, "FQ")
         # compute_validation_perplexities(args, quant_model, eval_datasets)
+        # all_metrics_per_question, all_metrics = wwb_eval.score(quant_model)
+        # similarity = float(all_metrics["similarity"].iloc[0])
+        # print(similarity)
         if not args.device_map:
             quant_model = quant_model.to(device)
 

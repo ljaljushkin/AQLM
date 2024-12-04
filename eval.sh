@@ -14,8 +14,14 @@ MODEL_NAME="Qwen2_5-3B-Instruct"
 # BASE_MODEL="google/gemma-2-2b-it"
 # MODEL_NAME="gemma-2-2b-it"
 
+# BASE_MODEL="meta-llama/Meta-Llama-3-8B"
+# MODEL_NAME="Meta-Llama-3-8B"
+
+BASE_MODEL="mistralai/Mistral-7B-v0.3"
+MODEL_NAME="Mistral-7B-v0_3"
+
 ROOT_DIR="$HOME/MODEL_DIR/$MODEL_NAME"
-command_template="lm_eval --model=hf --model_args=pretrained=${BASE_MODEL},trust_remote_code=True,nncf_ckpt_dir=\${nncf_ckpt_dir},dtype=bfloat16 --tasks=wikitext"
+command_template="lm_eval --model=hf --model_args=pretrained=${BASE_MODEL},trust_remote_code=True,nncf_ckpt_dir=\${nncf_ckpt_dir}/last_ckpt,dtype=bfloat16,max_length=4096 --tasks=wikitext"
 
 rank8_names=(
     # weekend_rank8_g64_seqlen1024_lr0.0005_lr_scale0_n128
@@ -45,7 +51,8 @@ rank8_names=(
     # slm_const_lr2e-04_fqlr1e-03_wd1e-03_rand100+_qloss_n1024_r1
     # slm_const_both_g64_rank256_lr1e-04_n1024_fqlr1e-03_wd0e+00_bs32_rand100+_qloss_10xB
     # slm_const_lr1e-04_fqlr1e-03_wd1e-03_rand100+_qloss_n128_r0.5
-    qwen_datawikitext2_lr5e-04_fqlr5e-05_wd5e-04_seqlen1024_n1024_rand100+_sqrtS
+    # qwen_datawikitext2_lr5e-04_fqlr5e-05_wd5e-04_seqlen1024_n1024_rand100+_sqrtS
+    Mistr_wikitext2_lr1e-04_fqlr1e-05_wd1e-04_n1024_bs32
 )
 
 # svd_names=(

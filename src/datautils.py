@@ -37,6 +37,50 @@ def get_red_pajama(nsamples, seqlen, tokenizer, eval_mode=False):
         trainloader.append(inp)
     return trainloader
 
+def get_gsm8k(nsamples, seqlen, tokenizer, eval_mode=False):
+    dataset = load_dataset('openai/gsm8k', split="train", trust_remote_code=True)
+    dataset = dataset.filter(lambda example: len(example["response"]) >= seqlen)
+
+    trainloader = []
+    l = set()
+    for data_item in dataset:
+        template = "Question:\n{instruction}\n\nAnswer:\n{response}"
+        # template = "{instruction}. {response}"
+        train_data = template.format(**data_item)
+        assert len(train_data) > seqlen, f'len={len(train_data)}'
+        trainenc = tokenizer(train_data, return_tensors="pt").input_ids
+        l.add(trainenc.numel())
+        trainloader.append(trainenc[:, :seqlen])
+    print(f'Loaded data: num_data={len(trainloader)}\n lengths={l}')
+    return trainloader
+
+
+
+def get_dolly(nsamples, seqlen, tokenizer, eval_mode=False):
+    dataset = load_dataset('databricks/databricks-dolly-15k', split="train", trust_remote_code=True)
+    dataset = dataset.filter(lambda example: len(example["response"]) >= seqlen)
+
+    trainloader = []
+    l = set()
+    for i, data_item in enumerate(dataset):
+        template = "Instruction:\n{instruction}\n\nResponse:\n{response}"
+        # template = "{instruction}. {response}"
+        train_data = template.format(**data_item)
+        train_data += '\n\nInstruction:\n{instruction}\n\nResponse:\n'
+        train_data = train_data.format(**dataset[i+1])
+        assert len(train_data) > seqlen, f'len={len(train_data)}'
+        trainenc = tokenizer(train_data, return_tensors="pt").input_ids
+        # TODO: try chat template
+        # prompt = instruction + start_token
+        # messages = [
+        #     {"role": "user", "content": train_data},
+        # ]
+        # trainenc = tokenizer.apply_chat_template(messages, return_tensors="pt").to("cuda")
+        l.add(trainenc.numel())
+        trainloader.append(trainenc[:, :seqlen])
+    print(f'Loaded data: num_data={len(trainloader)}\n lengths={l}')
+    return trainloader
+
 def get_synthetic_as_is(model_id, tokenizer):
     ROOT_DIR = Path('/local_ssd2/nlyalyus/projects/aqlm/gen_data')
     model_name = Path(model_id).name.replace('.', '_')
@@ -48,7 +92,7 @@ def get_synthetic_as_is(model_id, tokenizer):
         text = json.loads(line)["text"]
         train_enc = tokenizer(text, return_tensors="pt").input_ids
         # TODO: need to pad, since concat is happening for batching, can run with batch=1
-        print('shape=', train_enc.shape)
+        # print('shape=', train_enc.shape)
         trainloader.append(train_enc)
     return trainloader
 
@@ -61,7 +105,7 @@ def get_synthetic_packed(nsamples, seqlen, tokenizer, model_id):
     print("Loading syntehtic from ", dataset_path)
     concated_text = "\n\n".join(json.loads(line)["text"] for line in dataset_path.open("r"))
     train_enc = tokenizer(concated_text, return_tensors="pt").input_ids
-    print('shape=', train_enc.shape, ' nsamples=', train_enc.shape[1] // seqlen)
+    # print('shape=', train_enc.shape, ' nsamples=', train_enc.shape[1] // seqlen)
     trainloader = torch.split(train_enc, seqlen, dim=1)[:-1]
     return trainloader
 
@@ -76,7 +120,6 @@ def get_wikitext2(nsamples, seqlen, tokenizer, eval_mode=False):
             i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
             j = i + seqlen
             inp = trainenc.input_ids[:, i:j]
-            print('shape=', inp.shape)
             trainloader.append(inp)
         return trainloader
     else:
@@ -270,6 +313,8 @@ def get_loaders(
             data = get_c4_new(nsamples, seqlen, tokenizer, eval_mode=eval_mode)
         elif name.lower() == "synth":
             data = get_synthetic_packed(nsamples, seqlen, tokenizer, model_id)
+        elif name.lower() == "dolly":
+            data = get_dolly(nsamples, seqlen, tokenizer, model_id)
         else:
             raise ValueError(
                 f"Failed to load data from {name}.",
