@@ -83,7 +83,7 @@ run_commands() {
 
 
 
-# run_commands "FQ_4bit_no_embed_svd_rank256_g64_bfloat16" "${rank8_names[@]}"
+run_commands "FQ_4bit_no_embed_svd_rank[256_g64_hybrid_rand_quant100+_sqrtS" "${rank8_names[@]}"
 # run_commands "FQ_4bit_no_embed_svd_rank256_g64_float32" "${rank8_names[@]}"
 run_commands "FQ_4bit_no_embed_svd_rank256_g64_hybrid_rand_quant100+_sqrtS" "${rank8_names[@]}"
 
