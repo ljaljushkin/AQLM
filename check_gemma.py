@@ -3,16 +3,41 @@ from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM
 )
+from peft import (
+    PeftModel,
+)
 from datasets import load_dataset
 
-MODEL_ID = 'google/gemma-2-2b-it'
+# MODEL_ID = 'google/gemma-2-2b-it'
+MODEL_ID = 'HuggingFaceTB/SmolLM-1.7B-Instruct'
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     device_map="auto",
     torch_dtype=torch.bfloat16,
 )
+print(hasattr(model.config, 'final_logit_softcapping'))
+# print(model.model.layers[0].self_attn.q_proj.lora_A.default.weight[:5, :5])
+# print(model.model.layers[0].self_attn.q_proj.lora_B.default.weight[:5, :5])
+# Gemma2ForCausalLM(
+#   (model): Gemma2Model(
+#     (embed_tokens): Embedding(256000, 2304, padding_idx=0)
+#     (layers): ModuleList(
+#       (0-25): 26 x Gemma2DecoderLayer(
+#         (self_attn): Gemma2Attention(
+#           (q_proj): lora.Linear(
+#             (base_layer): Linear(in_features=2304, out_features=2048, bias=False)
+#             (lora_dropout): ModuleDict(
+#               (default): Identity()
+#             )
+#             (lora_A): ModuleDict(
+# print(model)
+# model = PeftModel.from_pretrained(
+#     model, '/local_ssd2/nlyalyus/MODEL_DIR/gemma-2-2b-it/peft_init', trust_remote_code=True
+# )
+# print(model)
+exit()
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 # print(model.device)
 # print(model.model.device)
 # standard

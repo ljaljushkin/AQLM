@@ -69,9 +69,9 @@ def get_quant_noise(quant_model, Xmap):
         loss += loss_
     return loss
 
-def lm_eval(args, ckpt_dir):
+def lm_eval(args, ckpt_dir, lm_eval_length=4096):
     result_path = ckpt_dir / "results.json"
-    cmd = f"lm_eval --model=hf --model_args=pretrained={args.base_model},trust_remote_code=True,nncf_ckpt_dir={ckpt_dir},device_map=auto,parallelize=True,dtype=bfloat16,max_length=4096 --tasks=wikitext --output_path={result_path}"
+    cmd = f"lm_eval --model=hf --model_args=pretrained={args.base_model},trust_remote_code=True,nncf_ckpt_dir={ckpt_dir},device_map=auto,parallelize=True,dtype=bfloat16,max_length={lm_eval_length} --tasks=wikitext --output_path={result_path}"
     sys.stdout.flush()
     subprocess.run(cmd.split(' '))
     with result_path.open('r') as f:
@@ -297,6 +297,10 @@ def get_lr(optimizer):
 
 
 def finetune(model_to_tune, train_loader, train_hiddens, args, device, ckpt_dir=None, eval_datasets=None, Xmap=None, wwb_eval=None):
+    ckpt_name = 'nncf_checkpoint.pth'
+    last_dir = ckpt_dir / "last_ckpt"
+    last_dir.mkdir(exist_ok=True, parents=True)
+
     # cast model to finetune dtype
     # TODO: just load with dtype=bfloat16 and keep FQ params in float32, otherwise they are not trained.
     # model_to_tune.to(args.finetune_dtype)
@@ -358,7 +362,7 @@ def finetune(model_to_tune, train_loader, train_hiddens, args, device, ckpt_dir=
             # scaled_lr = args.lr * (1 + args.lr_scale * (i_switch / num_switches))
             # scaled_lr = scaled_lr if is_lora else scaled_lr / 50
             # metadata["scaled_lr"] = scaled_lr
-            opt = torch.optim.AdamW(param_to_train)#, betas=(args.adam_beta1, args.adam_beta2))
+            opt = torch.optim.AdamW(param_to_train, lr=args.lr)#, betas=(args.adam_beta1, args.adam_beta2))
             # scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
             if args.cosine:
                 lr_scheduler = transformers.get_cosine_schedule_with_warmup(
@@ -386,6 +390,12 @@ def finetune(model_to_tune, train_loader, train_hiddens, args, device, ckpt_dir=
                 targets = lm_head(
                     _extract_into_tensor(train_hiddens, batch_indices, device=device, dtype=args.finetune_dtype)
                 )
+                if hasattr(model_to_tune.config, 'final_logit_softcapping'):
+                    fls = model_to_tune.config.final_logit_softcapping
+                    if fls is not None:
+                        targets = targets / fls
+                        targets = torch.tanh(targets)
+                        targets = targets * fls
 
             # with torch.autocast(device_type="cuda", enabled=args.amp):
             outputs = model_to_tune(inputs).logits
@@ -445,9 +455,6 @@ def finetune(model_to_tune, train_loader, train_hiddens, args, device, ckpt_dir=
                 metadata["23dj_B"] = torch.linalg.norm(layer._lora_B.data).item()
                 metadata["23dj_IL"] = torch.linalg.norm(layer.input_low.data).item()
                 metadata["23dj_IR"] = torch.linalg.norm(layer.input_range.data).item()
-                # visualize norm A, B, input_low, input_range,
-                # layer=FQ_LORA_for_node_layers_23_mlp_down_proj_weight - 142
-                # layer=FQ_LORA_for_node_layers_23_self_attn_o_proj_weight - 35
 
             # NOTE: debug that some parameters updated and some - frozen
             # A_after = model_to_tune.model._nncf.external_quantizers.FQ_LORA_for_node_layers_31_mlp_gate_up_proj_weight._lora_A.data
@@ -490,11 +497,8 @@ def finetune(model_to_tune, train_loader, train_hiddens, args, device, ckpt_dir=
         #     metadata["wwb_similarity"] = similarity
         #     print('Similarity: ', similarity)
 
-        ckpt_name = 'nncf_checkpoint.pth'
-        last_dir = ckpt_dir / "last_ckpt"
-        last_dir.mkdir(exist_ok=True, parents=True)
         save_checkpoint(model_to_tune.model, last_dir, ckpt_name)
-        word_ppl = lm_eval(args, last_dir)
+        word_ppl = lm_eval(args, last_dir, args.lm_eval_length)
         print(word_ppl)
         metadata["lm_eval_word_ppl"] = word_ppl
         if word_ppl < metadata["best_eval_perplexity"]:
@@ -540,6 +544,11 @@ def save_checkpoint(wrapped_model, ckpt_dir, ckpt_name = "nncf_checkpoint.pth"):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(add_help=True)
     # Model params
+    parser.add_argument(
+        "--lm_eval_length",
+        type=int,
+        default=4096,
+    )
     parser.add_argument(
         "--qloss",
         action="store_true",
@@ -786,9 +795,8 @@ if __name__ == "__main__":
             mlflow.set_experiment('Tune FQLoRA')
             # wandb.init(config=args, name=exp_name)
 
-        word_ppl = lm_eval(args, Path(args.nncf_ckpt_dir))
+        word_ppl = lm_eval(args, Path(args.nncf_ckpt_dir), args.lm_eval_length)
         print('word ppl for int4 init', word_ppl)
-
         if args.keep_best_model:
             assert args.eval_datasets is not None, f"--keep_best_model requires --eval_datasets"
 

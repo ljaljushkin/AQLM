@@ -21,29 +21,29 @@ set -e
 BASE_MODEL="HuggingFaceTB/SmolLM-1.7B-Instruct"
 MODEL_NAME="SmolLM-1_7B-Instruct"
 
-BASE_MODEL="microsoft/Phi-3-mini-4k-instruct"
-MODEL_NAME="Phi-3-mini-4k-instruct"
+# BASE_MODEL="microsoft/Phi-3-mini-4k-instruct"
+# MODEL_NAME="Phi-3-mini-4k-instruct"
 
 # BASE_MODEL="microsoft/Phi-3.5-mini-instruct"
 # MODEL_NAME="Phi-3_5-mini-instruct"
 
-BASE_MODEL="Qwen/Qwen2.5-3B-Instruct"
-MODEL_NAME="Qwen2_5-3B-Instruct"
+# BASE_MODEL="Qwen/Qwen2.5-3B-Instruct"
+# MODEL_NAME="Qwen2_5-3B-Instruct"
 
 # BASE_MODEL="google/gemma-2-2b-it"
 # MODEL_NAME="gemma-2-2b-it"
 
-BASE_MODEL="meta-llama/Meta-Llama-3-8B"
-MODEL_NAME="Meta-Llama-3-8B"
+# BASE_MODEL="meta-llama/Meta-Llama-3-8B-Instruct"
+# MODEL_NAME="Meta-Llama-3-8B-Instruct"
 
-BASE_MODEL="mistralai/Mistral-7B-v0.3"
-MODEL_NAME="Mistral-7B-v0_3"
+# BASE_MODEL="mistralai/Mistral-7B-v0.3"
+# MODEL_NAME="Mistral-7B-v0_3"
 
-BASE_MODEL="meta-llama/Llama-3.2-1B-Instruct"
-MODEL_NAME="Llama-3_2-1B-Instruct"
+# BASE_MODEL="meta-llama/Llama-3.2-1B-Instruct"
+# MODEL_NAME="Llama-3_2-1B-Instruct"
 
-BASE_MODEL="meta-llama/Llama-3.2-3B-Instruct"
-MODEL_NAME="Llama-3_2-3B-Instruct"
+# BASE_MODEL="meta-llama/Llama-3.2-3B-Instruct"
+# MODEL_NAME="Llama-3_2-3B-Instruct"
 
 tune_command_template="PYTHONIOENCODING=utf-8 python finetune.py \
 --nncf_ckpt_dir=$HOME/MODEL_DIR/$MODEL_NAME/FQ_4bit_no_embed_svd_rank\${rank}_g64_hybrid_rand_quant100+_sqrtS/ \
@@ -69,7 +69,9 @@ tune_command_template="PYTHONIOENCODING=utf-8 python finetune.py \
 --dtype=bfloat16 \
 --finetune_dtype=bfloat16 \
 --device_map=auto \
+--lm_eval_length=2048 \
 --mlflow"
+# --lm_eval_length=2048 \
 # --qloss \
 # --device_map=auto \
 # --exp_name=slm_const_lr2e-04_fqlr1e-03_wd1e-03_rand100+_qloss_n1024_r1"

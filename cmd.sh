@@ -21,23 +21,29 @@ set -e
 BASE_MODEL="HuggingFaceTB/SmolLM-1.7B-Instruct"
 MODEL_NAME="SmolLM-1_7B-Instruct"
 
-BASE_MODEL="microsoft/Phi-3-mini-4k-instruct"
-MODEL_NAME="Phi-3-mini-4k-instruct"
+# BASE_MODEL="microsoft/Phi-3-mini-4k-instruct"
+# MODEL_NAME="Phi-3-mini-4k-instruct"
 
 # BASE_MODEL="microsoft/Phi-3.5-mini-instruct"
 # MODEL_NAME="Phi-3_5-mini-instruct"
 
-BASE_MODEL="Qwen/Qwen2.5-3B-Instruct"
-MODEL_NAME="Qwen2_5-3B-Instruct"
+# BASE_MODEL="Qwen/Qwen2.5-3B-Instruct"
+# MODEL_NAME="Qwen2_5-3B-Instruct"
 
 # BASE_MODEL="google/gemma-2-2b-it"
 # MODEL_NAME="gemma-2-2b-it"
 
-BASE_MODEL="meta-llama/Meta-Llama-3-8B"
-MODEL_NAME="Meta-Llama-3-8B"
+# BASE_MODEL="meta-llama/Meta-Llama-3-8B-Instruct"
+# MODEL_NAME="Meta-Llama-3-8B-Instruct"
 
-BASE_MODEL="meta-llama/Llama-3.2-1B-Instruct"
-MODEL_NAME="Llama-3_2-1B-Instruct"
+# BASE_MODEL="mistralai/Mistral-7B-v0.3"
+# MODEL_NAME="Mistral-7B-v0_3"
+
+# BASE_MODEL="meta-llama/Llama-3.2-1B-Instruct"
+# MODEL_NAME="Llama-3_2-1B-Instruct"
+
+# BASE_MODEL="meta-llama/Llama-3.2-3B-Instruct"
+# MODEL_NAME="Llama-3_2-3B-Instruct"
 
 tune_command_template="PYTHONIOENCODING=utf-8 python finetune.py \
 --nncf_ckpt_dir=$HOME/MODEL_DIR/$MODEL_NAME/FQ_4bit_no_embed_svd_rank\${rank}_g64_hybrid_rand_quant100+_sqrtS/ \
@@ -50,7 +56,6 @@ tune_command_template="PYTHONIOENCODING=utf-8 python finetune.py \
 --batch_size=\$batch_size \
 --microbatch_size=\$microbatch_size \
 --trust_remote_code  \
---keep_best_model \
 --nsamples=\$nsamples \
 --weight_decay=\$weight_decay \
 --dataset=\$dataset \
@@ -63,7 +68,11 @@ tune_command_template="PYTHONIOENCODING=utf-8 python finetune.py \
 --dtype=bfloat16 \
 --finetune_dtype=bfloat16 \
 --device_map=auto \
+--keep_best_model \
+--lm_eval_length=2048 \
 --mlflow"
+
+# --exp_name=peft_gemma \
 # --qloss \
 
 # --exp_name=slm_const_lr2e-04_fqlr1e-03_wd1e-03_rand100+_qloss_n1024_r1"
@@ -76,15 +85,15 @@ tune_command_template="PYTHONIOENCODING=utf-8 python finetune.py \
 # "--wandb_project=trainer_tune"
 # DISTILLATION
 
-weight_decays=1e-4 #2e-4 1e-2) #(0 1e-5 1e-2)
+weight_decays=5e-5 #2e-4 1e-2) #(0 1e-5 1e-2)
 rank=256
 model_seqlen=1024
 batch_sizes=32 #(128 64) #32
 microbatch_size=2 #2 #2
 list_nsamples=1024 #128
 dataset=wikitext2
-lrs=1e-4
-fq_lrs=1e-5
+lrs=5e-5
+fq_lrs=5e-6
 lr_scale=0 # 1 2)
 num_blocks=32 # 8)
 frequencys=32 #2 #(8 16 32)
