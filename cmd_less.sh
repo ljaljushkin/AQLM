@@ -84,15 +84,15 @@ tune_command_template="PYTHONIOENCODING=utf-8 python finetune.py \
 # "--wandb_project=trainer_tune"
 # DISTILLATION
 
-weight_decays=5e-5 #2e-4 1e-2) #(0 1e-5 1e-2)
+weight_decays=1e-4 #2e-4 1e-2) #(0 1e-5 1e-2)
 rank=256
 model_seqlen=1024
 batch_sizes=32 #(128 64) #32
 microbatch_size=2 #2 #2
 list_nsamples=1024 #128
 dataset=wikitext2
-lrs=5e-5
-fq_lrs=5e-6
+lrs=1e-4
+fq_lrs=1e-5
 lr_scale=0 # 1 2)
 num_blocks=32 # 8)
 frequencys=32 #2 #(8 16 32)
