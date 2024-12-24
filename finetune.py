@@ -95,7 +95,7 @@ def get_Xmap(model_, calib_dataloader):
         handle.remove()
     return mean_values_list_per_module
 
-def load_nncf_quantized_model(nncf_ckpt_dir, student_model, tokenizer):
+def load_nncf_quantized_model(nncf_ckpt_dir, student_model, tokenizer, merge_8bit_FQ=False):
     tokenized_text = tokenizer("example", return_tensors="pt")
     input_ids = tokenized_text["input_ids"]#[:, :-1]
     attention_mask = tokenized_text["attention_mask"]#[:, :-1]
@@ -111,11 +111,11 @@ def load_nncf_quantized_model(nncf_ckpt_dir, student_model, tokenizer):
     from nncf.torch import load_from_config
 
     # NOTE: hf_model.model because hf_model.model used for compression, where hf_model = AutoModelForCausalLM(...)
-    student_model.model = load_from_config(
-        student_model.model, nncf_ckpt["nncf_config"],
+    student_model = load_from_config(
+        student_model, nncf_ckpt["nncf_config"],
         example_input=example_input
     )
-    student_model.model.nncf.load_state_dict(nncf_ckpt["nncf_state_dict"])
+    student_model.nncf.load_state_dict(nncf_ckpt["nncf_state_dict"])
     return student_model
 
 def get_nb_trainable_parameters(module):
@@ -266,6 +266,7 @@ def set_trainable(args, model, list_of_indexes: List[int]):
     for name, param in model.named_parameters():
         for index in list_of_indexes:
             # if f"layers_{index}_" in name and word_to_find in name:
+            # TODO: don't want to tune 8bit.
             if f"layers_{index}_" in name and "lora_A" in name:# and "self_attn" in name:
                 param.requires_grad = True
                 adapters_to_train.append(param)
@@ -278,6 +279,10 @@ def set_trainable(args, model, list_of_indexes: List[int]):
                 param.requires_grad = True
                 scales_to_train.append(param)
                 break
+            # if f"embed_tokens" in name and "input" in name:# and "self_attn" in name:
+            #     param.requires_grad = True
+            #     scales_to_train.append(param)
+            #     break
 
     for name, param in model.named_parameters():
         if param.requires_grad:
@@ -296,7 +301,9 @@ def get_lr(optimizer):
         return param_group['lr']
 
 
-def finetune(model_to_tune, train_loader, train_hiddens, args, device, ckpt_dir=None, eval_datasets=None, Xmap=None, wwb_eval=None):
+def finetune(model_to_tune, train_loader, train_hiddens, args, device, ckpt_dir=None, eval_datasets=None, Xmap=None, wwb_eval=None, lm_head=None, init_ppl=None):
+    if init_ppl is None:
+        init_ppl = float("inf")
     ckpt_name = 'nncf_checkpoint.pth'
     last_dir = ckpt_dir / "last_ckpt"
     last_dir.mkdir(exist_ok=True, parents=True)
@@ -305,7 +312,6 @@ def finetune(model_to_tune, train_loader, train_hiddens, args, device, ckpt_dir=
     # TODO: just load with dtype=bfloat16 and keep FQ params in float32, otherwise they are not trained.
     # model_to_tune.to(args.finetune_dtype)
     # NOTE: copy is needed for calculating target outputs
-    lm_head = deepcopy(model_to_tune.lm_head)
     for param in lm_head.parameters():
         param.requires_grad = False
 
@@ -319,7 +325,8 @@ def finetune(model_to_tune, train_loader, train_hiddens, args, device, ckpt_dir=
         model_to_tune.enable_input_require_grads()
 
     metadata = OrderedDict([
-        ('lm_eval_word_ppl', float("inf")),
+        ('lm_eval_word_ppl', init_ppl),
+        ('lm_eval_word_ppl_no_init', float("inf")),
         ('perplexity_wikitext2', float("inf")),
         ('aggregated_loss', float("nan")),
         ('aggregated_kl_loss', float("nan")),
@@ -344,7 +351,7 @@ def finetune(model_to_tune, train_loader, train_hiddens, args, device, ckpt_dir=
     # num_epochs = args.epochs
     num_training_steps = epoch_samples // args.batch_size
     cached_targets = None
-    layer = model_to_tune.model._nncf.external_quantizers.FQ_LORA_for_node_layers_13_mlp_down_proj_weight
+    layer = model_to_tune._nncf.external_quantizers.FQ_LORA_for_node_model_layers_13_mlp_down_proj_weight
     qloss_strength = 1/2
     for epoch in range(num_epochs):
         if epoch % args.frequency == 0:
@@ -422,9 +429,11 @@ def finetune(model_to_tune, train_loader, train_hiddens, args, device, ckpt_dir=
             if layer._lora_A.grad is not None:
                 metadata["23dj_gA"] = torch.linalg.norm(layer._lora_A.grad.data).item()
                 metadata["23dj_gB"] = torch.linalg.norm(layer._lora_B.grad.data).item()
-            if layer.input_low.grad is not None:
+            if hasattr(layer, 'input_low') and layer.input_low.grad is not None:
                 metadata["23dj_gIL"] = torch.linalg.norm(layer.input_low.grad.data).item()
                 metadata["23dj_gIR"] = torch.linalg.norm(layer.input_range.grad.data).item()
+            if hasattr(layer, 'scale') and layer.scale.grad is not None:
+                metadata["23dj_gS"] = torch.linalg.norm(layer.scale.grad.data).item()
 
             if metadata["grad_steps_accumulated"] == grad_accumulation_steps:
                 # print('step')
@@ -453,8 +462,12 @@ def finetune(model_to_tune, train_loader, train_hiddens, args, device, ckpt_dir=
 
                 metadata["23dj_A"] = torch.linalg.norm(layer._lora_A.data).item()
                 metadata["23dj_B"] = torch.linalg.norm(layer._lora_B.data).item()
-                metadata["23dj_IL"] = torch.linalg.norm(layer.input_low.data).item()
-                metadata["23dj_IR"] = torch.linalg.norm(layer.input_range.data).item()
+                if hasattr(layer, 'input_low'):
+                    metadata["23dj_IL"] = torch.linalg.norm(layer.input_low.data).item()
+                    metadata["23dj_IR"] = torch.linalg.norm(layer.input_range.data).item()
+                else:
+                    metadata["23dj_gS"] = torch.linalg.norm(layer.scale.data).item()
+
 
             # NOTE: debug that some parameters updated and some - frozen
             # A_after = model_to_tune.model._nncf.external_quantizers.FQ_LORA_for_node_layers_31_mlp_gate_up_proj_weight._lora_A.data
@@ -475,12 +488,15 @@ def finetune(model_to_tune, train_loader, train_hiddens, args, device, ckpt_dir=
                     'aggregated_kl_loss',
                     'aggregated_q_loss',
                     'lm_eval_word_ppl',
-                    'perplexity_wikitext2',
+                    'lm_eval_word_ppl_no_init',
+                    'best_eval_perplexity',
                     'current_epoch',
                     '23dj_A',
                     '23dj_gA',
                     '23dj_B',
                     '23dj_gB',
+                    '23dj_S',
+                    '23dj_gS',
                     '23dj_IL',
                     '23dj_gIL',
                     '23dj_IR',
@@ -497,10 +513,10 @@ def finetune(model_to_tune, train_loader, train_hiddens, args, device, ckpt_dir=
         #     metadata["wwb_similarity"] = similarity
         #     print('Similarity: ', similarity)
 
-        save_checkpoint(model_to_tune.model, last_dir, ckpt_name)
+        save_checkpoint(model_to_tune, last_dir, ckpt_name)
         word_ppl = lm_eval(args, last_dir, args.lm_eval_length)
         print(word_ppl)
-        metadata["lm_eval_word_ppl"] = word_ppl
+        metadata["lm_eval_word_ppl_no_init"] = metadata["lm_eval_word_ppl"] = word_ppl
         if word_ppl < metadata["best_eval_perplexity"]:
             print(f"New best lm_eval word perplexity = {word_ppl:.4f}")
             metadata["best_eval_perplexity"] = word_ppl
@@ -783,7 +799,7 @@ if __name__ == "__main__":
     MODEL_DIR.mkdir(exist_ok=True, parents=True)
     is_cosine = 'cosine' if args.cosine else 'const'
     qloss = '_qloss' if args.qloss else ''
-    exp_name =  args.exp_name if args.exp_name else f"{model_name[:5]}_{args.dataset}_lr{args.lr:.0e}_fqlr{args.fq_lr:.0e}_wd{args.weight_decay:.0e}_n{args.nsamples}_bs{args.batch_size}"
+    exp_name =  args.exp_name if args.exp_name else f"{model_name[:5]}_lr{args.lr:.0e}_fqlr{args.fq_lr:.0e}_wd{args.weight_decay:.0e}_gs-1_sym_signed_int8_emb_frozen"
     ckpt_dir = Path(args.nncf_ckpt_dir) / exp_name
     ckpt_dir.mkdir(exist_ok=True, parents=True)
     log_filename = ckpt_dir / 'tune.log'
@@ -795,8 +811,9 @@ if __name__ == "__main__":
             mlflow.set_experiment('Tune FQLoRA')
             # wandb.init(config=args, name=exp_name)
 
-        word_ppl = lm_eval(args, Path(args.nncf_ckpt_dir), args.lm_eval_length)
-        print('word ppl for int4 init', word_ppl)
+        # init_ppl = None
+        init_ppl = lm_eval(args, Path(args.nncf_ckpt_dir), args.lm_eval_length)
+        print('word ppl for int4 init', init_ppl)
         if args.keep_best_model:
             assert args.eval_datasets is not None, f"--keep_best_model requires --eval_datasets"
 
@@ -841,6 +858,7 @@ if __name__ == "__main__":
         orig_model = get_model(args.base_model, None, args.dtype, args.device_map, trust_remote_code=args.trust_remote_code)
         if not args.device_map:
             orig_model = orig_model.to(device)
+        lm_head = deepcopy(orig_model.lm_head)
         # compute_validation_perplexities(args, orig_model, eval_datasets)
         # exit()
 
@@ -919,7 +937,9 @@ if __name__ == "__main__":
                     ckpt_dir=ckpt_dir,
                     eval_datasets=eval_datasets,
                     Xmap=Xmap,
-                    wwb_eval=wwb_eval
+                    wwb_eval=wwb_eval,
+                    lm_head=lm_head,
+                    init_ppl=init_ppl
                 )
 
                 # generate_overfit(quant_model, tokenizer, "after tune")
