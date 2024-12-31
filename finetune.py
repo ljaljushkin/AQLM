@@ -275,7 +275,7 @@ def set_trainable(args, model, list_of_indexes: List[int]):
                 param.requires_grad = True
                 B_adapters_to_train.append(param)
                 break
-            if f"layers_{index}_" in name and "input" in name:# and "self_attn" in name:
+            if f"layers_{index}_" in name and ("input" in name or "scale" in name):# and "self_attn" in name:
                 param.requires_grad = True
                 scales_to_train.append(param)
                 break
@@ -799,7 +799,7 @@ if __name__ == "__main__":
     MODEL_DIR.mkdir(exist_ok=True, parents=True)
     is_cosine = 'cosine' if args.cosine else 'const'
     qloss = '_qloss' if args.qloss else ''
-    exp_name =  args.exp_name if args.exp_name else f"{model_name[:5]}_lr{args.lr:.0e}_fqlr{args.fq_lr:.0e}_wd{args.weight_decay:.0e}_gs-1_sym_signed_int8_emb_frozen"
+    exp_name =  args.exp_name if args.exp_name else f"{model_name[:5]}_lr{args.lr:.0e}_fqlr{args.fq_lr:.0e}_wd{args.weight_decay:.0e}_tune_both_signed_2"
     ckpt_dir = Path(args.nncf_ckpt_dir) / exp_name
     ckpt_dir.mkdir(exist_ok=True, parents=True)
     log_filename = ckpt_dir / 'tune.log'
