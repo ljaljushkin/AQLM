@@ -466,7 +466,7 @@ def finetune(model_to_tune, train_loader, train_hiddens, args, device, ckpt_dir=
                     metadata["23dj_IL"] = torch.linalg.norm(layer.input_low.data).item()
                     metadata["23dj_IR"] = torch.linalg.norm(layer.input_range.data).item()
                 else:
-                    metadata["23dj_gS"] = torch.linalg.norm(layer.scale.data).item()
+                    metadata["23dj_S"] = torch.linalg.norm(layer.scale.data).item()
 
 
             # NOTE: debug that some parameters updated and some - frozen
